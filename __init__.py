@@ -9,6 +9,12 @@ def register(ctx):
     from hermes_constants import get_hermes_home
     from gateway.session_context import get_session_env
 
+    install_root = get_hermes_home() / "gws-oauth"
+    if install_root.is_symlink():
+        raise RuntimeError(f"Refusing symlinked gws-oauth directory: {install_root}")
+    install_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    install_root.chmod(0o700)
+
     manager = LoginManager()
     ctx.on_unload(manager.close)
 

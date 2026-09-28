@@ -37,7 +37,7 @@ Each profile owns separate OAuth clients and authorized accounts. Repeat the ins
 
 ### Install the OAuth client manually
 
-For security, the plugin **never accepts, downloads, or installs `client_secret.json` through chat**. It creates `$HERMES_HOME/gws-oauth/` with mode `0700` on the first `gws_login` attempt, then reports that the client file is missing. Provision the file locally for each profile.
+For security, the plugin **never accepts, downloads, or installs `client_secret.json` through chat**. Plugin activation creates `$HERMES_HOME/gws-oauth/` with mode `0700`. Installation with `--enable` reloads a running gateway immediately; if no gateway is running, start or restart it once after installation. Then provision the client file locally before calling `gws_login`; the login flow creates neither the directory nor the client file.
 
 1. Configure the required Workspace APIs and OAuth consent screen in Google Cloud.
 2. Create an OAuth client of type **Desktop app**. If the consent screen is in *Testing*, add every account under *Test users*.
@@ -45,7 +45,6 @@ For security, the plugin **never accepts, downloads, or installs `client_secret.
 
 ```bash
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-install -d -m 700 "$HERMES_HOME/gws-oauth"
 install -m 600 /secure/path/client_secret.json \
   "$HERMES_HOME/gws-oauth/client_secret.json"
 ```

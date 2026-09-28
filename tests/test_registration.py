@@ -1,6 +1,7 @@
 """The distributed package registers all three agent tools."""
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -22,21 +23,27 @@ class RegistrationTests(unittest.TestCase):
             register_hook=lambda name, callback: None,
             on_unload=lambda callback: None,
         )
-        hermes_constants = ModuleType("hermes_constants")
-        setattr(hermes_constants, "get_hermes_home", lambda: Path("."))
-        gateway = ModuleType("gateway")
-        setattr(gateway, "__path__", [])
-        session_context = ModuleType("gateway.session_context")
-        setattr(session_context, "get_session_env", lambda key: None)
-        with patch.dict(sys.modules, {
-            "hermes_constants": hermes_constants,
-            "gateway": gateway,
-            "gateway.session_context": session_context,
-        }):
-            plugin.register(ctx)
-        self.assertEqual(set(tools), {"gws_login", "gws_accounts", "gws_api"})
-        result = tools["gws_login"]["handler"]({"account": "user@example.com"})
-        self.assertIn("chat privado", result)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            hermes_constants = ModuleType("hermes_constants")
+            setattr(hermes_constants, "get_hermes_home", lambda: home)
+            gateway = ModuleType("gateway")
+            setattr(gateway, "__path__", [])
+            session_context = ModuleType("gateway.session_context")
+            setattr(session_context, "get_session_env", lambda key: None)
+            with patch.dict(sys.modules, {
+                "hermes_constants": hermes_constants,
+                "gateway": gateway,
+                "gateway.session_context": session_context,
+            }):
+                plugin.register(ctx)
+            state_dir = home / "gws-oauth"
+            self.assertTrue(state_dir.is_dir())
+            self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
+            self.assertFalse((state_dir / "client_secret.json").exists())
+            self.assertEqual(set(tools), {"gws_login", "gws_accounts", "gws_api"})
+            result = tools["gws_login"]["handler"]({"account": "user@example.com"})
+            self.assertIn("chat privado", result)
 
 
 if __name__ == "__main__":

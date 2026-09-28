@@ -99,15 +99,14 @@ class LoginTests(unittest.TestCase):
         self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").exists())
         self.assertFalse(self.handles[0][0].active)
 
-    def test_missing_root_is_created_for_manual_client_install(self):
+    def test_login_requires_precreated_root_and_client(self):
         root = self.home / "fresh-profile" / "gws-oauth"
         result = self.manager.start(
             root, "telegram", "100", "42", "user@example.com", str(self.fake),
             self.register, timeout=10,
         )
         self.assertFalse(result["ok"])
-        self.assertTrue(root.is_dir())
-        self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(root.exists())
         self.assertIn("client_secret.json", result["error"])
 
     def test_custom_scopes_are_forwarded_to_gws(self):

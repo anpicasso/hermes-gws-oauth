@@ -104,10 +104,6 @@ class LoginManager:
             command = _login_command(gws_bin, scope_mode, scopes)
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
-        try:
-            root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        except OSError:
-            return {"ok": False, "error": f"No se pudo crear el directorio privado {root}."}
         client = root / "client_secret.json"
         if not client.is_file() or client.is_symlink():
             return {"ok": False, "error": f"Falta client_secret.json de aplicación Desktop en {root}."}
