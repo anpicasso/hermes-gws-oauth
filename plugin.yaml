@@ -1,0 +1,14 @@
+name: gws-oauth
+version: 0.2.1
+manifest_version: 2
+description: Remote OAuth login and native multi-account gws passthrough per Hermes profile
+license: MIT
+provides_tools:
+  - gws_login
+  - gws_accounts
+  - gws_api
+config_schema:
+  gws_bin:
+    type: str
+    default: gws
+    description: Path to the gws executable if it is not on the gateway PATH

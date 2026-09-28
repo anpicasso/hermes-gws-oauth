@@ -1,0 +1,69 @@
+"""Hermes plugin: per-profile Google Workspace CLI accounts and temporary OAuth hook."""
+import json
+
+from .oauth import LoginManager
+from .router import execute_gws, list_accounts
+
+
+def register(ctx):
+    from hermes_constants import get_hermes_home
+    from gateway.session_context import get_session_env
+
+    manager = LoginManager()
+    ctx.on_unload(manager.close)
+
+    def root():
+        return get_hermes_home() / "gws-oauth"
+
+    def login(args, **kwargs):
+        platform = get_session_env("HERMES_SESSION_PLATFORM")
+        chat = get_session_env("HERMES_SESSION_CHAT_ID")
+        user = get_session_env("HERMES_SESSION_USER_ID")
+        kind = get_session_env("HERMES_SESSION_CHAT_TYPE")
+        if kind not in ("dm", "private"):
+            return json.dumps({"ok": False, "error": "Inicia este flujo desde un chat privado del gateway."})
+        result = manager.start(
+            root(), platform, chat, user, args.get("account"),
+            ctx.get_config("gws_bin", default="gws"),
+            lambda callback: ctx.register_hook("pre_gateway_dispatch", callback),
+            profile=get_session_env("HERMES_SESSION_PROFILE"),
+            scope_mode=args.get("scope_mode", "full"),
+            scopes=args.get("scopes"),
+        )
+        return json.dumps(result)
+
+    def accounts(args, **kwargs):
+        return json.dumps({"ok": True, "accounts": list_accounts(root())})
+
+    def api(args, **kwargs):
+        try:
+            result = execute_gws(
+                root(), args.get("account"), args.get("args"),
+                gws_bin=ctx.get_config("gws_bin", default="gws"),
+            )
+        except (OSError, ValueError) as exc:
+            result = {"ok": False, "error": str(exc)}
+        return json.dumps(result)
+
+    ctx.register_tool(
+        name="gws_login", toolset="gws_oauth", handler=login,
+        schema={"name": "gws_login", "description": "Inicia OAuth Desktop de gws para una cuenta Google en el perfil actual. Úsalo solo tras recibir del usuario el correo y el nivel de permisos que quiere autorizar, y en chat privado. Devuelve una URL de Google; pide pegar en el mismo chat la URL localhost completa del navegador. Nunca solicites un password ni un token.",
+                "parameters": {"type": "object", "properties": {
+                    "account": {"type": "string", "description": "Correo Google exacto a autorizar"},
+                    "scope_mode": {"type": "string", "enum": ["default", "readonly", "full", "custom"], "default": "full", "description": "Modo nativo de permisos de gws; full permite todos los servicios compatibles"},
+                    "scopes": {"type": "array", "items": {"type": "string"}, "description": "Scopes OAuth exactos; requerido solo con scope_mode=custom"}},
+                    "required": ["account"]}},
+    )
+    ctx.register_tool(
+        name="gws_accounts", toolset="gws_oauth", handler=accounts,
+        schema={"name": "gws_accounts", "description": "Lista las cuentas autorizadas en el perfil actual, sin revelar credenciales.",
+                "parameters": {"type": "object", "properties": {}, "required": []}},
+    )
+    ctx.register_tool(
+        name="gws_api", toolset="gws_oauth", handler=api,
+        schema={"name": "gws_api", "description": "Ejecuta gws tal cual para una cuenta explícita del perfil. Los argumentos se pasan sin limitar comandos, opciones ni acceso a archivos locales.",
+                "parameters": {"type": "object", "properties": {
+                    "account": {"type": "string", "description": "Correo exacto de una cuenta autorizada"},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "Argumentos exactos posteriores al ejecutable gws, por ejemplo [\"drive\",\"files\",\"list\"]"}},
+                    "required": ["account", "args"]}},
+    )
