@@ -2,8 +2,8 @@
 
 Plugin activation creates the profile-local `$HERMES_HOME/gws-oauth/` directory with mode `0700`. The plugin keeps a `LoginManager` inside the Hermes process that executes `gws_login`. For each login attempt it:
 
-1. Resolves `get_hermes_home()` for the active profile and requires an existing Desktop OAuth client at `gws-oauth/client_secret.json`; login never creates the directory or client file.
-2. Creates a private temporary directory, copies the client with mode `0600`, and launches `gws auth login` with the chosen native mode (`--readonly`, `--full`, `--scopes ...`, or the default). Inherited `GOOGLE_WORKSPACE_CLI_*` and `GOOGLE_APPLICATION_CREDENTIALS` values are removed, and `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file` is set.
+1. Resolves `get_hermes_home()` for the active profile. It uses `gws-oauth/client_secret.json` when present; otherwise it asks `gws auth status` for the native global client path (normally `~/.config/gws/client_secret.json`). The profile client is therefore an override. Login never creates either file.
+2. Creates a private temporary directory, copies the selected client with mode `0600`, and launches `gws auth login` with the chosen native mode (`--readonly`, `--full`, `--scopes ...`, or the default). Inherited `GOOGLE_WORKSPACE_CLI_*` and `GOOGLE_APPLICATION_CREDENTIALS` values are removed, and `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file` is set. Only the client is shared; account credentials are still committed under the active Hermes profile.
 3. Reads the authorization URL printed by `gws`, extracts its `redirect_uri=http://localhost:<port>`, and temporarily registers `pre_gateway_dispatch` through `ctx.register_hook()`.
 4. Accepts callbacks only from the profile, platform, chat, and sender associated with the live attempt. URL parsing requires the exact port and path plus one valid `code`. The plugin sends only that code to `127.0.0.1:<port>`; it never fetches a user-selected URL.
 5. Waits for `gws`, verifies the returned Google identity and `credentials.enc`, then atomically moves the temporary directory to `accounts/<account>/`.
@@ -29,6 +29,6 @@ hermes plugins doctor . --ci
 hermes plugins validate .
 ```
 
-The tests launch a fake `gws` executable that listens on a real loopback socket. They cover fragmented authorization output, callback rewriting without code leakage, sender and profile binding, timeout cleanup, account identity verification, custom scopes, and per-profile credential selection.
+The tests launch a fake `gws` executable that listens on a real loopback socket. They cover fragmented authorization output, callback rewriting without code leakage, sender and profile binding, timeout cleanup, account identity verification, custom scopes, global-client fallback, profile-client precedence, and per-profile credential selection.
 
 A real Google authorization still requires the user's Desktop OAuth client and consent; offline tests cannot prove that external flow.

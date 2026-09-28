@@ -44,6 +44,41 @@ def _login_command(gws_bin, scope_mode, scopes):
     return command
 
 
+def _native_client_path(gws_bin, env):
+    """Ask gws for its native client path, with the documented path as fallback."""
+    fallback = Path.home() / ".config" / "gws" / "client_secret.json"
+    try:
+        result = subprocess.run(
+            [gws_bin, "auth", "status"], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False,
+        )
+        status = json.loads(result.stdout) if result.returncode == 0 else {}
+        candidate = Path(status.get("client_config", "") if isinstance(status, dict) else "").expanduser()
+        return candidate if candidate.is_absolute() else fallback
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+        return fallback
+
+
+def _select_client(root, gws_bin, env, global_client=None):
+    profile = root / "client_secret.json"
+    if profile.is_symlink():
+        raise ValueError(f"El cliente OAuth del perfil no puede ser un enlace simbólico: {profile}")
+    if profile.exists():
+        if not profile.is_file():
+            raise ValueError(f"El cliente OAuth del perfil no es un archivo regular: {profile}")
+        return profile
+
+    shared = Path(global_client).expanduser() if global_client else _native_client_path(gws_bin, env)
+    if shared.is_symlink():
+        raise ValueError(f"El cliente OAuth global de gws no puede ser un enlace simbólico: {shared}")
+    if shared.is_file():
+        return shared
+    raise ValueError(
+        f"Falta client_secret.json Desktop: instala el override del perfil en {profile} "
+        f"o configura el cliente global de gws en {shared}."
+    )
+
+
 @dataclass
 class _Attempt:
     process: subprocess.Popen
@@ -91,7 +126,7 @@ class LoginManager:
         raise RuntimeError("gws no produjo una URL OAuth")
 
     def start(self, root, platform, chat_id, user_id, account, gws_bin, register_hook, *,
-              timeout=300, profile="", scope_mode="full", scopes=None):
+              timeout=300, profile="", scope_mode="full", scopes=None, global_client=None):
         root = Path(root).expanduser().resolve()
         key = self._key(root, platform, chat_id, user_id, profile)
         if not platform or not chat_id or not user_id or platform in {"cli", "tui", "desktop", "api_server"}:
@@ -104,9 +139,12 @@ class LoginManager:
             command = _login_command(gws_bin, scope_mode, scopes)
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
-        client = root / "client_secret.json"
-        if not client.is_file() or client.is_symlink():
-            return {"ok": False, "error": f"Falta client_secret.json de aplicación Desktop en {root}."}
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("GOOGLE_WORKSPACE_CLI_") and k != "GOOGLE_APPLICATION_CREDENTIALS"}
+        try:
+            client = _select_client(root, gws_bin, env, global_client)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         if (root / "accounts" / account.lower()).exists():
             return {"ok": False, "error": "La cuenta ya está configurada en este perfil."}
         with self._lock:
@@ -120,8 +158,6 @@ class LoginManager:
             target = directory / "client_secret.json"
             target.write_bytes(client.read_bytes())
             target.chmod(0o600)
-            env = {k: v for k, v in os.environ.items()
-                   if not k.startswith("GOOGLE_WORKSPACE_CLI_") and k != "GOOGLE_APPLICATION_CREDENTIALS"}
             env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = str(directory)
             env["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"] = "file"
             try:

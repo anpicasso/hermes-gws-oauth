@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from oauth import LoginManager
@@ -15,6 +16,9 @@ from oauth import LoginManager
 FAKE_GWS = '''#!{python}
 import json, os, socket, sys
 from pathlib import Path
+if sys.argv[1:3] == ["auth", "status"]:
+    print(json.dumps({"client_config": os.environ.get("FAKE_GLOBAL_CLIENT", "")}))
+    sys.exit(0)
 if sys.argv[1:3] != ["auth", "login"]:
     sys.exit(2)
 dir = Path(os.environ["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"])
@@ -103,11 +107,36 @@ class LoginTests(unittest.TestCase):
         root = self.home / "fresh-profile" / "gws-oauth"
         result = self.manager.start(
             root, "telegram", "100", "42", "user@example.com", str(self.fake),
-            self.register, timeout=10,
+            self.register, timeout=10, global_client=root / "missing-global.json",
         )
         self.assertFalse(result["ok"])
         self.assertFalse(root.exists())
         self.assertIn("client_secret.json", result["error"])
+
+    def test_global_gws_client_is_fallback_and_profile_client_overrides_it(self):
+        profile = self.home / "client_secret.json"
+        shared = self.home / "global-client.json"
+        shared.write_text('{"installed":{"client_id":"global"}}')
+        profile.unlink()
+
+        with mock.patch.dict(os.environ, {"FAKE_GLOBAL_CLIENT": str(shared)}):
+            result = self.manager.start(
+                self.home, "telegram", "100", "42", "user@example.com", str(self.fake),
+                self.register, timeout=10,
+            )
+        self.assertTrue(result["ok"])
+        attempt = next(iter(self.manager._attempts.values()))
+        self.assertEqual((attempt.directory / "client_secret.json").read_bytes(), shared.read_bytes())
+        self.manager.close()
+
+        profile.write_text('{"installed":{"client_id":"profile"}}')
+        result = self.manager.start(
+            self.home, "telegram", "100", "42", "user@example.com", str(self.fake),
+            self.register, timeout=10, global_client=shared,
+        )
+        self.assertTrue(result["ok"])
+        attempt = next(iter(self.manager._attempts.values()))
+        self.assertEqual((attempt.directory / "client_secret.json").read_bytes(), profile.read_bytes())
 
     def test_custom_scopes_are_forwarded_to_gws(self):
         scopes = ["openid", "https://www.googleapis.com/auth/drive.readonly"]
