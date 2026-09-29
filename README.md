@@ -95,7 +95,7 @@ Hermes calls `gws_login` with one of the native `gws` permission modes:
 - `full` (default)
 - `custom` with explicit OAuth scopes
 
-Open the returned Google URL and grant access. When the browser fails while opening `localhost`, copy the **complete URL from the address bar** and paste it into the same chat. The plugin sends the one-time code only to the waiting local `gws` process and rewrites the message before it reaches the agent.
+Open the returned Google URL and grant access. When the browser fails while opening `localhost`, copy the **complete URL from the address bar** and paste it into the same chat. Both `http://localhost:...` and Safari's protocol-less `localhost:...` form are accepted. The plugin sends the one-time code only to the waiting local `gws` process and rewrites the message before it reaches the agent.
 
 A login expires after five minutes. Only one attempt may run for the same user and chat, while different users may authorize concurrently. The Google identity returned by `gws` must match the requested account.
 

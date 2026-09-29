@@ -103,6 +103,21 @@ class LoginTests(unittest.TestCase):
         self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").exists())
         self.assertFalse(self.handles[0][0].active)
 
+    def test_callback_without_scheme_is_accepted(self):
+        result = self.start()
+        from urllib.parse import parse_qs, urlsplit
+        redirect = parse_qs(urlsplit(result["url"]).query)["redirect_uri"][0]
+        callback = self.handles[0][1]
+
+        response = asyncio.run(callback(event=self.event(
+            (redirect + "?code=good").removeprefix("http://")
+        )))
+
+        self.assertEqual(response["action"], "rewrite")
+        self.assertIn("user@example.com", response["text"])
+        self.assertNotIn("code=", response["text"])
+        self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").exists())
+
     def test_login_requires_precreated_root_and_client(self):
         root = self.home / "fresh-profile" / "gws-oauth"
         result = self.manager.start(

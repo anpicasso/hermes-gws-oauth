@@ -179,7 +179,7 @@ class LoginManager:
                 attempt.timer = timer
                 timer.start()
                 return {"ok": True, "url": url, "account": account.lower(), "timeout_seconds": timeout,
-                        "instructions": "Abre el enlace, acepta los permisos y pega aquí la URL localhost completa que aparezca tras el error del navegador."}
+                        "instructions": "Abre el enlace, acepta los permisos y pega aquí la URL localhost completa que aparezca tras el error del navegador; puede venir con o sin http://."}
             except (OSError, ValueError, RuntimeError, TypeError):
                 self._attempts.pop(key, None)
                 if not self._attempts and self._hook is not None:
@@ -271,7 +271,9 @@ class LoginManager:
         if not matching:
             return None
         text = str(event.text or "").strip()
-        if not text.startswith("http://localhost:"):
+        if text.startswith("localhost:"):
+            text = "http://" + text
+        elif not text.startswith("http://localhost:"):
             return None
         if len(text) > 8192:
             return {"action": "rewrite", "text": "[Google Workspace: URL de callback demasiado larga; inicia un nuevo login.]"}
