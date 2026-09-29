@@ -130,7 +130,7 @@ class LoginManager:
         root = Path(root).expanduser().resolve()
         key = self._key(root, platform, chat_id, user_id, profile)
         if not platform or not chat_id or not user_id or platform in {"cli", "tui", "desktop", "api_server"}:
-            return {"ok": False, "error": "Inicia este flujo desde un chat privado del gateway."}
+            return {"ok": False, "error": "Inicia este flujo desde un chat del gateway con identidad de usuario."}
         if not _EMAIL.fullmatch(account or ""):
             return {"ok": False, "error": "Indica el correo exacto de la cuenta Google."}
         if not 0 < timeout <= 900:

@@ -25,9 +25,6 @@ def register(ctx):
         platform = get_session_env("HERMES_SESSION_PLATFORM")
         chat = get_session_env("HERMES_SESSION_CHAT_ID")
         user = get_session_env("HERMES_SESSION_USER_ID")
-        kind = get_session_env("HERMES_SESSION_CHAT_TYPE")
-        if kind not in ("dm", "private"):
-            return json.dumps({"ok": False, "error": "Inicia este flujo desde un chat privado del gateway."})
         result = manager.start(
             root(), platform, chat, user, args.get("account"),
             ctx.get_config("gws_bin", default="gws"),
@@ -53,7 +50,7 @@ def register(ctx):
 
     ctx.register_tool(
         name="gws_login", toolset="gws_oauth", handler=login,
-        schema={"name": "gws_login", "description": "Inicia OAuth Desktop de gws para una cuenta Google en el perfil actual. Úsalo solo tras recibir del usuario el correo y el nivel de permisos que quiere autorizar, y en chat privado. Devuelve una URL de Google; pide pegar en el mismo chat la URL localhost completa del navegador. Nunca solicites un password ni un token.",
+        schema={"name": "gws_login", "description": "Inicia OAuth Desktop de gws para una cuenta Google en el perfil actual. Úsalo solo tras recibir del usuario el correo y el nivel de permisos que quiere autorizar. Devuelve una URL de Google; pide pegar en el mismo chat la URL localhost completa del navegador. Nunca solicites un password ni un token.",
                 "parameters": {"type": "object", "properties": {
                     "account": {"type": "string", "description": "Correo Google exacto a autorizar"},
                     "scope_mode": {"type": "string", "enum": ["default", "readonly", "full", "custom"], "default": "full", "description": "Modo nativo de permisos de gws; full permite todos los servicios compatibles"},

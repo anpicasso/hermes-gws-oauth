@@ -1,5 +1,5 @@
 name: gws-oauth
-version: 0.3.0
+version: 0.3.1
 manifest_version: 2
 description: Remote OAuth login and native multi-account gws passthrough per Hermes profile
 license: MIT

@@ -17,7 +17,7 @@ The hook runs before the gateway authorization check, so binding every attempt t
 
 `pre_gateway_dispatch` has no automatic timeout. The manager therefore enforces its own five-minute lease and bounded local network operations. A busy adapter may enqueue a message before the hook processes it; the plugin cannot control copies already retained by the messaging provider. Pending attempts are not restored after a gateway process stops.
 
-The dynamic hook exists only in the process that started `gws_login`. A TUI, Desktop, CLI, or API client may run elsewhere, so this release accepts the pasted callback only in the same private gateway chat that initiated the login.
+The dynamic hook exists only in the process that started `gws_login`. A TUI, Desktop, CLI, or API client may run elsewhere, so this release accepts the pasted callback only from the same gateway chat, sender, and profile that initiated the login. The chat may be private or shared; disclosure risk in shared chats is the user's choice and is documented in the README.
 
 ## Offline verification
 
