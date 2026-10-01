@@ -237,6 +237,56 @@ class LoginTests(unittest.TestCase):
         self.assertIn("no se pudo", response["text"])
         self.assertFalse((self.home / "accounts" / "other@example.com").exists())
 
+    def test_terminal_chat_finishes_without_hook_and_is_session_bound(self):
+        for platform in ("cli", "tui"):
+            with self.subTest(platform=platform):
+                root = self.home / platform
+                root.mkdir()
+                (root / "client_secret.json").write_bytes((self.home / "client_secret.json").read_bytes())
+                result = self.manager.start(root, platform, "session-1", "local", "user@example.com",
+                                            str(self.fake), self.register, timeout=10, profile="default")
+                self.assertTrue(result["ok"])
+                self.assertEqual(self.handles, [], "terminal chat must not register an interception hook")
+                attempt = next(iter(self.manager._attempts.values()))
+                callback = (attempt.redirect + "?code=good").removeprefix("http://")
+                for target, session, profile, account in (
+                    (root, "session-2", "default", "user@example.com"),
+                    (root, "session-1", "other", "user@example.com"),
+                    (self.home, "session-1", "default", "user@example.com"),
+                    (root, "session-1", "default", "other@example.com"),
+                ):
+                    self.assertFalse(self.manager.finish(target, platform, session, "local", account,
+                                                         callback, profile=profile)["ok"])
+                for invalid in ("https://example.com/?code=good", "http://localhost:invalid/?code=good",
+                                attempt.redirect + "/wrong?code=good", "x" * 8193, None):
+                    self.assertFalse(self.manager.finish(root, platform, "session-1", "local", "user@example.com",
+                                                         invalid, profile="default")["ok"])
+                response = self.manager.finish(root, platform, "session-1", "local", "user@example.com",
+                                               callback, profile="default")
+                self.assertTrue(response["ok"], response)
+                self.assertNotIn("code=", json.dumps(response))
+                self.assertTrue((root / "accounts" / "user@example.com" / "credentials.enc").is_file())
+                self.assertFalse(self.manager._attempts)
+                self.assertFalse(self.manager.finish(root, platform, "session-1", "local", "user@example.com",
+                                                     callback, profile="default")["ok"])
+
+    def test_terminal_chat_rejects_invalid_codes_and_wrong_google_identity(self):
+        for account, query in (("user@example.com", "?code=good&code=bad"),
+                               ("user@example.com", "?code=bad"),
+                               ("other@example.com", "?code=good")):
+            with self.subTest(account=account, query=query):
+                result = self.manager.start(self.home, "cli", "session-1", "local", account,
+                                            str(self.fake), self.register, timeout=10)
+                self.assertTrue(result["ok"])
+                attempt = next(iter(self.manager._attempts.values()))
+                response = self.manager.finish(self.home, "cli", "session-1", "local", account,
+                                               attempt.redirect + query)
+                self.assertFalse(response["ok"])
+                self.assertFalse((self.home / "accounts" / account).exists())
+                self.assertFalse(attempt.directory.exists())
+                self.assertIsNotNone(attempt.process.poll())
+                self.assertFalse(self.manager._attempts)
+
     def test_same_port_different_path_is_rejected_and_expired_attempt_not_reused(self):
         result = self.start()
         from urllib.parse import parse_qs, urlsplit

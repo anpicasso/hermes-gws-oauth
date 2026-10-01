@@ -19,9 +19,11 @@ class RegistrationTests(unittest.TestCase):
     def test_plugin_exposes_login_and_profile_tools(self):
         tools = {}
         starts = []
+        finishes = []
         manager = SimpleNamespace(
             close=lambda: None,
             start=lambda *args, **kwargs: starts.append((args, kwargs)) or {"ok": True},
+            finish=lambda *args, **kwargs: finishes.append((args, kwargs)) or {"ok": True},
         )
         ctx = SimpleNamespace(
             get_config=lambda key, default=None: default,
@@ -59,6 +61,20 @@ class RegistrationTests(unittest.TestCase):
             result = json.loads(tools["gws_login"]["handler"]({"account": "user@example.com"}))
             self.assertTrue(result["ok"])
             self.assertEqual(starts[0][0][1:5], ("discord", "thread-1", "user-1", "user@example.com"))
+            for platform in ("cli", "tui"):
+                session.clear()
+                session.update(HERMES_SESSION_SOURCE=platform, HERMES_SESSION_ID="terminal-1")
+                handler = tools["gws_login"]["handler"]
+                self.assertTrue(json.loads(handler({"account": "user@example.com"}))["ok"])
+                self.assertEqual(starts[-1][0][1:5], (platform, "terminal-1", "local", "user@example.com"))
+                callback = "localhost:1234/?code=fixture"
+                self.assertTrue(json.loads(handler({"account": "user@example.com", "callback_url": callback}))["ok"])
+                self.assertEqual(finishes[-1][0][1:], (platform, "terminal-1", "local", "user@example.com", callback))
+                self.assertTrue(json.loads(handler({"account": "user@example.com"}, session_id="terminal-2"))["ok"])
+                self.assertEqual(starts[-1][0][2], "terminal-2")
+                self.assertTrue(json.loads(handler({"account": "user@example.com", "callback_url": None}))["ok"])
+                self.assertEqual(starts[-1][0][2], "terminal-1")
+            self.assertIn("callback_url", tools["gws_login"]["schema"]["parameters"]["properties"])
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ Plugin activation creates the private directory:
 $HERMES_HOME/gws-oauth/
 ```
 
-Installation with `--enable` reloads a running gateway immediately. If no gateway is running, start or restart it once so the plugin activates and creates the directory.
+Installation with `--enable` reloads a running gateway immediately. For terminal use, open a fresh CLI/TUI chat so the plugin activates and creates the directory; no gateway is required.
 
 Before calling `gws_login`, configure a Google Desktop OAuth client in either location:
 

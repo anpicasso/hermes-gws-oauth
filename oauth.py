@@ -1,7 +1,7 @@
 """Supervise one gws Desktop OAuth login per profile/chat/sender.
 
-The hook is leased only while a child waits on its loopback callback. The
-pasted authorization code is never returned to a model or put in a CLI argv.
+The gateway hook is leased only while a child waits on its loopback callback.
+CLI/TUI callbacks pass through the model; neither path puts codes in CLI argv.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 
 _EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+%-]*@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\Z")
 _URL = re.compile(r"https://accounts\.google\.com/[^\s]+")
+LOCAL_PLATFORMS = frozenset({"cli", "tui"})
 
 
 def _login_command(gws_bin, scope_mode, scopes):
@@ -95,7 +96,7 @@ class _Attempt:
 class LoginManager:
     def __init__(self):
         self._lock = threading.RLock()
-        self._attempts: dict[tuple[str, str, str, str], _Attempt] = {}
+        self._attempts: dict[tuple[str, str, str, str, str], _Attempt] = {}
         self._hook = None
 
     @staticmethod
@@ -129,8 +130,8 @@ class LoginManager:
               timeout=300, profile="", scope_mode="full", scopes=None, global_client=None):
         root = Path(root).expanduser().resolve()
         key = self._key(root, platform, chat_id, user_id, profile)
-        if not platform or not chat_id or not user_id or platform in {"cli", "tui", "desktop", "api_server"}:
-            return {"ok": False, "error": "Inicia este flujo desde un chat del gateway con identidad de usuario."}
+        if not platform or not chat_id or not user_id or platform in {"desktop", "api_server"}:
+            return {"ok": False, "error": "Inicia este flujo desde un chat CLI/TUI con sesión o un chat del gateway con identidad de usuario."}
         if not _EMAIL.fullmatch(account or ""):
             return {"ok": False, "error": "Indica el correo exacto de la cuenta Google."}
         if not 0 < timeout <= 900:
@@ -172,7 +173,7 @@ class LoginManager:
                     raise ValueError("gws devolvió un redirect inesperado")
                 attempt = _Attempt(proc, directory, redirect, account.lower(), time.monotonic() + timeout)
                 self._attempts[key] = attempt
-                if self._hook is None or not self._hook.active:
+                if platform not in LOCAL_PLATFORMS and (self._hook is None or not self._hook.active):
                     self._hook = register_hook(self.on_message)
                 timer = threading.Timer(timeout, self._expire, args=(key, attempt))
                 timer.daemon = True
@@ -262,6 +263,51 @@ class LoginManager:
             attempt.directory.rename(destination)
         return attempt.account
 
+    def finish(self, root, platform, chat_id, user_id, account, callback_url, *, profile=""):
+        """Complete a terminal-chat login explicitly, without intercepting user input."""
+        if platform not in LOCAL_PLATFORMS:
+            return {"ok": False, "error": "En gateway pega el callback en el mismo chat; lo procesa el hook."}
+        key = self._key(root, platform, chat_id, user_id, profile)
+        with self._lock:
+            attempt = self._attempts.get(key)
+        if attempt is None or not isinstance(account, str) or account.lower() != attempt.account:
+            return {"ok": False, "error": "No hay un login pendiente para esta cuenta en esta sesión."}
+        try:
+            if not isinstance(callback_url, str) or len(callback_url) > 8192:
+                raise ValueError("Callback inválido")
+            text = callback_url.strip()
+            if text.startswith("localhost:"):
+                text = "http://" + text
+            parsed = urlsplit(text)
+            redirect = urlsplit(attempt.redirect)
+            if (parsed.scheme != "http" or parsed.hostname != "localhost" or
+                    parsed.port != redirect.port or (parsed.path or "/") != (redirect.path or "/")):
+                raise ValueError("Callback inválido")
+        except ValueError:
+            return {"ok": False, "error": "URL de callback inválida; copia la URL localhost completa de este login."}
+        # ponytail: CLI/TUI deliberately use normal tool arguments and chat history.
+        return self._complete_callback(key, attempt, parsed)
+
+    def _complete_callback(self, key, attempt, parsed):
+        with self._lock, attempt.lock:
+            if attempt.processing:
+                return {"ok": False, "error": "La autorización ya se está procesando."}
+            attempt.processing = True
+        try:
+            query = parse_qs(parsed.query, strict_parsing=True)
+            code = query.get("code", [])
+            if parsed.username or parsed.password or parsed.fragment or len(code) != 1 or not code[0] or not re.fullmatch(r"[A-Za-z0-9_./~-]{1,2048}", code[0]):
+                raise ValueError("Callback inválido")
+            if time.monotonic() >= attempt.deadline or attempt.process.poll() is not None:
+                raise RuntimeError("Intento vencido")
+            account = self._fetch_and_commit(attempt, code[0], Path(key[0]))
+            return {"ok": True, "account": account,
+                    "message": f"[Google Workspace: {account} autorizada en este perfil; credenciales guardadas. Verifica con gws_accounts y gws_api.]"}
+        except Exception:
+            return {"ok": False, "error": "no se pudo completar el login. Inicia uno nuevo; no repitas el enlace."}
+        finally:
+            self._expire(key, attempt, finished=True)
+
     async def on_message(self, event, **kwargs):
         source = event.source
         platform = getattr(getattr(source, "platform", None), "value", None)
@@ -294,23 +340,12 @@ class LoginManager:
             if not matches:
                 return {"action": "rewrite", "text": "[Google Workspace: ruta de callback incorrecta; vuelve a copiarla.]"}
             key, attempt = matches[0]
-            if attempt.processing:
-                return {"action": "rewrite", "text": "La autorización ya se está procesando."}
-            attempt.processing = True
         # Every recognised callback is rewritten, including all errors. Never log the URL.
         try:
-            query = parse_qs(parsed.query, strict_parsing=True)
-            code = query.get("code", [])
-            if parsed.username or parsed.password or parsed.fragment or len(code) != 1 or not code[0] or not re.fullmatch(r"[A-Za-z0-9_./~-]{1,2048}", code[0]):
-                raise ValueError("Callback inválido")
-            if time.monotonic() >= attempt.deadline or attempt.process.poll() is not None:
-                raise RuntimeError("Intento vencido")
-            account = await asyncio.to_thread(self._fetch_and_commit, attempt, code[0], Path(key[0]))
-            message = f"[Google Workspace: {account} autorizada en este perfil; credenciales guardadas. Verifica con gws_accounts y gws_api.]"
+            result = await asyncio.to_thread(self._complete_callback, key, attempt, parsed)
+            message = result.get("message") or f"[Google Workspace: {result['error']}]"
         except (Exception, asyncio.CancelledError):
             message = "[Google Workspace: no se pudo completar el login. Inicia uno nuevo; no repitas el enlace.]"
-        finally:
-            self._expire(key, attempt, finished=True)
         gateway = kwargs.get("gateway")
         message_id = str(getattr(source, "message_id", "") or getattr(event, "message_id", "") or "")
         if gateway is not None and message_id:

@@ -1,7 +1,7 @@
 """Hermes plugin: per-profile Google Workspace CLI accounts and temporary OAuth hook."""
 import json
 
-from .oauth import LoginManager
+from .oauth import LOCAL_PLATFORMS, LoginManager
 from .router import execute_gws, list_accounts
 
 
@@ -22,14 +22,22 @@ def register(ctx):
         return get_hermes_home() / "gws-oauth"
 
     def login(args, **kwargs):
-        platform = get_session_env("HERMES_SESSION_PLATFORM")
+        platform = get_session_env("HERMES_SESSION_PLATFORM") or get_session_env("HERMES_SESSION_SOURCE", "cli")
         chat = get_session_env("HERMES_SESSION_CHAT_ID")
         user = get_session_env("HERMES_SESSION_USER_ID")
+        profile = get_session_env("HERMES_SESSION_PROFILE")
+        if platform in LOCAL_PLATFORMS:
+            chat, user = kwargs.get("session_id") or get_session_env("HERMES_SESSION_ID"), "local"
+        if args.get("callback_url") is not None:
+            return json.dumps(manager.finish(
+                root(), platform, chat, user, args.get("account"), args["callback_url"],
+                profile=profile,
+            ))
         result = manager.start(
             root(), platform, chat, user, args.get("account"),
             ctx.get_config("gws_bin", default="gws"),
             lambda callback: ctx.register_hook("pre_gateway_dispatch", callback),
-            profile=get_session_env("HERMES_SESSION_PROFILE"),
+            profile=profile,
             scope_mode=args.get("scope_mode", "full"),
             scopes=args.get("scopes"),
         )
@@ -50,9 +58,10 @@ def register(ctx):
 
     ctx.register_tool(
         name="gws_login", toolset="gws_oauth", handler=login,
-        schema={"name": "gws_login", "description": "Inicia OAuth Desktop de gws para una cuenta Google en el perfil actual. Úsalo solo tras recibir del usuario el correo y el nivel de permisos que quiere autorizar. Devuelve una URL de Google; pide pegar en el mismo chat la URL localhost completa del navegador, con o sin http://. Nunca solicites un password ni un token.",
+        schema={"name": "gws_login", "description": "Inicia OAuth Desktop de gws para una cuenta Google en el perfil actual. Úsalo solo tras recibir del usuario el correo y el nivel de permisos que quiere autorizar. Devuelve una URL de Google; pide pegar en el mismo chat la URL localhost completa del navegador, con o sin http://. En chat CLI/TUI, al recibirla vuelve a llamar esta herramienta con el mismo account y callback_url; el callback pasa por el modelo y queda en el historial. En gateway lo procesa el hook automáticamente. Nunca solicites un password ni un token.",
                 "parameters": {"type": "object", "properties": {
                     "account": {"type": "string", "description": "Correo Google exacto a autorizar"},
+                    "callback_url": {"type": "string", "description": "Solo CLI/TUI: URL localhost completa pegada por el usuario para finalizar el login pendiente en esta misma sesión"},
                     "scope_mode": {"type": "string", "enum": ["default", "readonly", "full", "custom"], "default": "full", "description": "Modo nativo de permisos de gws; full permite todos los servicios compatibles"},
                     "scopes": {"type": "array", "items": {"type": "string"}, "description": "Scopes OAuth exactos; requerido solo con scope_mode=custom"}},
                     "required": ["account"]}},
