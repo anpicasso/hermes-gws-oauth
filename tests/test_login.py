@@ -237,14 +237,14 @@ class LoginTests(unittest.TestCase):
         self.assertIn("no se pudo", response["text"])
         self.assertFalse((self.home / "accounts" / "other@example.com").exists())
 
-    def test_terminal_chat_finishes_without_hook_and_is_session_bound(self):
-        for platform in ("cli", "tui"):
+    def test_any_surface_finishes_without_hook_and_is_session_bound(self):
+        for platform in ("cli", "tui", "desktop", "api_server", "custom_ui", "telegram"):
             with self.subTest(platform=platform):
                 root = self.home / platform
                 root.mkdir()
                 (root / "client_secret.json").write_bytes((self.home / "client_secret.json").read_bytes())
                 result = self.manager.start(root, platform, "session-1", "local", "user@example.com",
-                                            str(self.fake), self.register, timeout=10, profile="default")
+                                            str(self.fake), None, timeout=10, profile="default")
                 self.assertTrue(result["ok"])
                 self.assertEqual(self.handles, [], "terminal chat must not register an interception hook")
                 attempt = next(iter(self.manager._attempts.values()))
@@ -257,6 +257,10 @@ class LoginTests(unittest.TestCase):
                 ):
                     self.assertFalse(self.manager.finish(target, platform, session, "local", account,
                                                          callback, profile=profile)["ok"])
+                self.assertFalse(self.manager.finish(root, "other_surface", "session-1", "local",
+                                                     "user@example.com", callback, profile="default")["ok"])
+                self.assertFalse(self.manager.finish(root, platform, "session-1", "another-user",
+                                                     "user@example.com", callback, profile="default")["ok"])
                 for invalid in ("https://example.com/?code=good", "http://localhost:invalid/?code=good",
                                 attempt.redirect + "/wrong?code=good", "x" * 8193, None):
                     self.assertFalse(self.manager.finish(root, platform, "session-1", "local", "user@example.com",
@@ -276,7 +280,7 @@ class LoginTests(unittest.TestCase):
                                ("other@example.com", "?code=good")):
             with self.subTest(account=account, query=query):
                 result = self.manager.start(self.home, "cli", "session-1", "local", account,
-                                            str(self.fake), self.register, timeout=10)
+                                            str(self.fake), None, timeout=10)
                 self.assertTrue(result["ok"])
                 attempt = next(iter(self.manager._attempts.values()))
                 response = self.manager.finish(self.home, "cli", "session-1", "local", account,

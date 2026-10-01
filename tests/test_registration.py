@@ -61,12 +61,13 @@ class RegistrationTests(unittest.TestCase):
             result = json.loads(tools["gws_login"]["handler"]({"account": "user@example.com"}))
             self.assertTrue(result["ok"])
             self.assertEqual(starts[0][0][1:5], ("discord", "thread-1", "user-1", "user@example.com"))
-            for platform in ("cli", "tui"):
+            for platform in ("cli", "tui", "desktop", "api_server", "custom_ui"):
                 session.clear()
                 session.update(HERMES_SESSION_SOURCE=platform, HERMES_SESSION_ID="terminal-1")
                 handler = tools["gws_login"]["handler"]
                 self.assertTrue(json.loads(handler({"account": "user@example.com"}))["ok"])
                 self.assertEqual(starts[-1][0][1:5], (platform, "terminal-1", "local", "user@example.com"))
+                self.assertIsNone(starts[-1][0][6], "non-gateway sessions must not register an input hook")
                 callback = "localhost:1234/?code=fixture"
                 self.assertTrue(json.loads(handler({"account": "user@example.com", "callback_url": callback}))["ok"])
                 self.assertEqual(finishes[-1][0][1:], (platform, "terminal-1", "local", "user@example.com", callback))
@@ -74,6 +75,13 @@ class RegistrationTests(unittest.TestCase):
                 self.assertEqual(starts[-1][0][2], "terminal-2")
                 self.assertTrue(json.loads(handler({"account": "user@example.com", "callback_url": None}))["ok"])
                 self.assertEqual(starts[-1][0][2], "terminal-1")
+            session.update(HERMES_SESSION_SOURCE="desktop", HERMES_SESSION_USER_ID="browser-user")
+            handler({"account": "user@example.com"}, session_id="desktop-session")
+            self.assertEqual(starts[-1][0][1:4], ("desktop", "desktop-session", "browser-user"))
+            session.update(HERMES_SESSION_PLATFORM="telegram", HERMES_SESSION_CHAT_ID="shared-chat",
+                           HERMES_SESSION_USER_ID="")
+            handler({"account": "user@example.com"}, session_id="do-not-substitute")
+            self.assertEqual(starts[-1][0][1:4], ("telegram", "shared-chat", ""))
             self.assertIn("callback_url", tools["gws_login"]["schema"]["parameters"]["properties"])
 
 

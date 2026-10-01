@@ -1,7 +1,7 @@
 """Supervise one gws Desktop OAuth login per profile/chat/sender.
 
 The gateway hook is leased only while a child waits on its loopback callback.
-CLI/TUI callbacks pass through the model; neither path puts codes in CLI argv.
+Explicit callbacks pass through the model; neither path puts codes in CLI argv.
 """
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from urllib.parse import parse_qs, urlsplit
 
 _EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+%-]*@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\Z")
 _URL = re.compile(r"https://accounts\.google\.com/[^\s]+")
-LOCAL_PLATFORMS = frozenset({"cli", "tui"})
 
 
 def _login_command(gws_bin, scope_mode, scopes):
@@ -130,8 +129,8 @@ class LoginManager:
               timeout=300, profile="", scope_mode="full", scopes=None, global_client=None):
         root = Path(root).expanduser().resolve()
         key = self._key(root, platform, chat_id, user_id, profile)
-        if not platform or not chat_id or not user_id or platform in {"desktop", "api_server"}:
-            return {"ok": False, "error": "Inicia este flujo desde un chat CLI/TUI con sesión o un chat del gateway con identidad de usuario."}
+        if not platform or not chat_id or not user_id:
+            return {"ok": False, "error": "Esta sesión necesita una identidad estable para completar OAuth."}
         if not _EMAIL.fullmatch(account or ""):
             return {"ok": False, "error": "Indica el correo exacto de la cuenta Google."}
         if not 0 < timeout <= 900:
@@ -173,7 +172,7 @@ class LoginManager:
                     raise ValueError("gws devolvió un redirect inesperado")
                 attempt = _Attempt(proc, directory, redirect, account.lower(), time.monotonic() + timeout)
                 self._attempts[key] = attempt
-                if platform not in LOCAL_PLATFORMS and (self._hook is None or not self._hook.active):
+                if register_hook is not None and (self._hook is None or not self._hook.active):
                     self._hook = register_hook(self.on_message)
                 timer = threading.Timer(timeout, self._expire, args=(key, attempt))
                 timer.daemon = True
@@ -264,9 +263,7 @@ class LoginManager:
         return attempt.account
 
     def finish(self, root, platform, chat_id, user_id, account, callback_url, *, profile=""):
-        """Complete a terminal-chat login explicitly, without intercepting user input."""
-        if platform not in LOCAL_PLATFORMS:
-            return {"ok": False, "error": "En gateway pega el callback en el mismo chat; lo procesa el hook."}
+        """Complete a login explicitly on any surface, bound to its original identity."""
         key = self._key(root, platform, chat_id, user_id, profile)
         with self._lock:
             attempt = self._attempts.get(key)
@@ -285,7 +282,7 @@ class LoginManager:
                 raise ValueError("Callback inválido")
         except ValueError:
             return {"ok": False, "error": "URL de callback inválida; copia la URL localhost completa de este login."}
-        # ponytail: CLI/TUI deliberately use normal tool arguments and chat history.
+        # ponytail: explicit completion uses normal tool arguments, not another ingress hook.
         return self._complete_callback(key, attempt, parsed)
 
     def _complete_callback(self, key, attempt, parsed):

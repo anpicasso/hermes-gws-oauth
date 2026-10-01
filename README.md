@@ -2,14 +2,14 @@
 
 Multi-account OAuth login and scope management for the [Google Workspace CLI (`gws`)](https://github.com/googleworkspace/cli) in Hermes Agent.
 
-The plugin keeps each account inside the active Hermes profile, exposes `gws` without adding a command denylist, and lets a user finish the otherwise-local OAuth callback from a gateway or terminal chat. It does not share tokens across profiles or modify Hermes core.
+The plugin keeps each account inside the active Hermes profile, exposes `gws` without adding a command denylist, and lets a user finish the otherwise-local OAuth callback from any Hermes platform. It does not share tokens across profiles or modify Hermes core.
 
 ## Prerequisites
 
 - **Node.js 18+** — required only when installing `gws` through npm. You can instead download a pre-built binary from [Google Workspace CLI releases](https://github.com/googleworkspace/cli/releases) or use another supported package manager.
 - **A Google Cloud project** — required for OAuth credentials. Create one through the [Google Cloud Console](https://console.cloud.google.com/), the `gcloud` CLI, or `gws auth setup`.
 - **A Google account with access to Google Workspace.**
-- **Hermes Agent** with a CLI/TUI chat session or a messaging gateway that provides stable chat and user identities.
+- **Hermes Agent** with a stable session identity: CLI, TUI, Desktop, API server, a messaging gateway, or another frontend.
 
 Install `gws` using one of its supported methods. For npm:
 
@@ -37,7 +37,7 @@ Authorized accounts always remain profile-scoped. The OAuth client may be shared
 
 ### Configure the OAuth client manually
 
-For security, the plugin **never accepts, downloads, or installs `client_secret.json` through chat**. Plugin activation creates `$HERMES_HOME/gws-oauth/` with mode `0700`. Installation with `--enable` reloads a running gateway immediately; if no gateway is running, start or restart it once after installation.
+For security, the plugin **never accepts, downloads, or installs `client_secret.json` through chat**. Plugin activation creates `$HERMES_HOME/gws-oauth/` with mode `0700`. Installation with `--enable` reloads a running gateway immediately. A non-gateway frontend loads the plugin when its agent process starts; no messaging gateway is required.
 
 `gws_login` selects the OAuth client in this order:
 
@@ -84,7 +84,7 @@ For terminal chats, close and reopen Hermes to load plugin code changes. For gat
 
 ## Use
 
-Ask Hermes in a CLI/TUI terminal chat or any gateway chat, including a DM, group, channel, or thread:
+Ask Hermes from any platform: CLI, TUI, Desktop, API server, or a gateway DM, group, channel, or thread:
 
 > Connect `person@example.com` to Google Workspace with read-only access.
 
@@ -97,13 +97,13 @@ Hermes calls `gws_login` with one of the native `gws` permission modes:
 
 Open the returned Google URL and grant access. When the browser fails while opening `localhost`, copy the **complete URL from the address bar** and paste it into the same chat. Both `http://localhost:...` and Safari's protocol-less `localhost:...` form are accepted. In gateway chats the plugin forwards the code to the waiting local `gws` process and rewrites the message before it reaches the agent.
 
-In CLI/TUI chats there is deliberately no interception: the callback reaches the model and remains in chat history. Hermes completes the pending login by calling the same `gws_login` tool again with the original `account` and the pasted `callback_url`. No terminal command or core patch is required.
+Outside gateway ingress there is deliberately no interception: the callback reaches the model and remains in chat history. Hermes completes the pending login by calling the same `gws_login` tool again with the original `account` and the pasted `callback_url`. Explicit completion is available on every platform, including gateways when the callback reaches the agent. No terminal command or core patch is required.
 
 A login expires after five minutes. Only one attempt may run for the same user and chat, while different users may authorize concurrently. The Google identity returned by `gws` must match the requested account.
 
 ## Tools
 
-- `gws_login(account, scope_mode="full", scopes=[], callback_url=None)` — starts OAuth for one account in a gateway or CLI/TUI chat. Omit `callback_url` to start; pass it only to finish an existing CLI/TUI attempt in the same session.
+- `gws_login(account, scope_mode="full", scopes=[], callback_url=None)` — starts OAuth for one account on any platform. Omit `callback_url` to start; pass it to finish an existing attempt with the same profile, surface, session and user identity.
 - `gws_accounts()` — lists the account labels stored in the active profile without revealing credentials.
 - `gws_api(account, args)` — executes `gws` for one explicit account and passes `args` verbatim. Example: `args=["drive", "files", "list", "--params", "{\"pageSize\":5}"]`.
 
@@ -120,7 +120,7 @@ Each account receives its own `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`.
 - `gws auth login` 0.22.5 uses a random loopback callback without PKCE or `state`. The plugin correlates the live process, exact port, profile, chat, and sender; this mitigates confusion but does not replace PKCE.
 - The pasted callback is not end-to-end secret on a messaging platform. The plugin rewrites recognized callbacks and attempts best-effort deletion, but platform servers, notifications, devices, and participants in a shared chat may retain or see copies. Choose the chat accordingly. Never send the OAuth client JSON, exported credentials, or refresh tokens through chat.
 - Paste the callback before the five-minute deadline. After expiry the temporary hook is gone and Hermes may receive the message normally.
-- Login completion works only in the process and profile that started it: the same chat and sender in gateway, or the same session in CLI/TUI. Terminal callbacks are not redacted or removed by the plugin; they may reach the model provider, logs, and persisted history. Desktop and API-server sessions are not supported.
+- Login completion works only in the process and profile that started it: the same chat and sender in gateway, or the same host-bound session identity in other frontends. Explicit callbacks are not redacted or removed by the plugin; they may reach the model provider, logs, and persisted history. API clients must preserve session identity and use the same worker process for both steps. There is no platform allowlist or denylist.
 - Account separation is logical per Hermes profile, not an operating-system security boundary against other processes running as the same user. A native global OAuth client may be shared, but authorized account tokens are never shared by this plugin.
 - `gws_api` preserves native `gws` capabilities, including local file access and remote mutations. The plugin adds no sandbox, denylist, or approval layer; the user is responsible for reviewing each operation.
 - `--full` may exceed the scope limit of an unverified external application. Use `default`, `readonly`, or `custom` when necessary.
