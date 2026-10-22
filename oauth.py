@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 import re
+import secrets
 import select
 import shutil
 import subprocess
@@ -18,6 +19,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+if __package__:
+    from .router import _commit_lock
+else:  # Direct module use by the standalone test suite.
+    from router import _commit_lock
 
 _EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+%-]*@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\Z")
 _URL = re.compile(r"https://accounts\.google\.com/[^\s]+")
@@ -79,6 +85,36 @@ def _select_client(root, gws_bin, env, global_client=None):
     )
 
 
+
+def _remove_path(path):
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _install_attempt(attempt, destination, accounts):
+    """Install validated credentials, replacing the old account only on success."""
+    with _commit_lock(accounts):
+        if time.monotonic() >= attempt.deadline:
+            raise RuntimeError("El login venció antes de guardar las credenciales")
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_dir():
+                raise RuntimeError("La ruta de la cuenta existente no es un directorio válido")
+            if not attempt.reauthorize:
+                raise RuntimeError("La cuenta ya estaba registrada")
+            backup = accounts / f".{destination.name}.backup-{secrets.token_hex(6)}"
+            os.rename(destination, backup)
+            try:
+                os.rename(attempt.directory, destination)
+            except BaseException:
+                os.rename(backup, destination)
+                raise
+            _remove_path(backup)
+        else:
+            os.rename(attempt.directory, destination)
+
+
 @dataclass
 class _Attempt:
     process: subprocess.Popen
@@ -86,6 +122,7 @@ class _Attempt:
     redirect: str
     account: str
     deadline: float
+    reauthorize: bool = False
     timer: threading.Timer | None = None
     processing: bool = False
     expired: bool = False
@@ -126,8 +163,11 @@ class LoginManager:
         raise RuntimeError("gws no produjo una URL OAuth")
 
     def start(self, root, platform, chat_id, user_id, account, gws_bin, register_hook, *,
-              timeout=300, profile="", scope_mode="full", scopes=None, global_client=None):
+              timeout: float = 300, profile="", scope_mode="full", scopes=None, global_client=None,
+              reauthorize=False):
         root = Path(root).expanduser().resolve()
+        if not isinstance(reauthorize, bool):
+            return {"ok": False, "error": "reauthorize debe ser un booleano."}
         key = self._key(root, platform, chat_id, user_id, profile)
         if not platform or not chat_id or not user_id:
             return {"ok": False, "error": "Esta sesión necesita una identidad estable para completar OAuth."}
@@ -145,14 +185,17 @@ class LoginManager:
             client = _select_client(root, gws_bin, env, global_client)
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
-        if (root / "accounts" / account.lower()).exists():
-            return {"ok": False, "error": "La cuenta ya está configurada en este perfil."}
+        destination = root / "accounts" / account.lower()
+        if destination.exists() or destination.is_symlink():
+            if destination.is_symlink() or not destination.is_dir():
+                return {"ok": False, "error": "La ruta de la cuenta existente no es un directorio válido."}
+            if not reauthorize:
+                return {"ok": False, "error": "La cuenta ya está configurada en este perfil. Usa reauthorize=true para renovarla sin tocar las credenciales actuales hasta confirmar la nueva identidad."}
         with self._lock:
             if key in self._attempts:
                 return {"ok": False, "error": "Ya hay un login pendiente en este chat."}
             pending_root = root / ".pending"
             pending_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            import secrets
             directory = pending_root / secrets.token_hex(12)
             directory.mkdir(mode=0o700)
             target = directory / "client_secret.json"
@@ -170,7 +213,10 @@ class LoginManager:
                 parsed = urlsplit(redirect)
                 if parsed.scheme != "http" or parsed.hostname != "localhost" or not parsed.port or parsed.path not in ("", "/"):
                     raise ValueError("gws devolvió un redirect inesperado")
-                attempt = _Attempt(proc, directory, redirect, account.lower(), time.monotonic() + timeout)
+                attempt = _Attempt(
+                    proc, directory, redirect, account.lower(), time.monotonic() + timeout,
+                    reauthorize=reauthorize,
+                )
                 self._attempts[key] = attempt
                 if register_hook is not None and (self._hook is None or not self._hook.active):
                     self._hook = register_hook(self.on_message)
@@ -257,9 +303,7 @@ class LoginManager:
         with attempt.lock:
             if attempt.expired or time.monotonic() >= attempt.deadline:
                 raise RuntimeError("El login venció antes de guardar las credenciales")
-            if destination.exists():
-                raise RuntimeError("La cuenta ya estaba registrada")
-            attempt.directory.rename(destination)
+            _install_attempt(attempt, destination, accounts)
         return attempt.account
 
     def finish(self, root, platform, chat_id, user_id, account, callback_url, *, profile=""):

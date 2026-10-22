@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import oauth
 from oauth import LoginManager
 
 
@@ -17,7 +18,7 @@ FAKE_GWS = '''#!{python}
 import json, os, socket, sys
 from pathlib import Path
 if sys.argv[1:3] == ["auth", "status"]:
-    print(json.dumps({"client_config": os.environ.get("FAKE_GLOBAL_CLIENT", "")}))
+    print(os.environ.get("FAKE_STATUS_JSON") or json.dumps({"client_config": os.environ.get("FAKE_GLOBAL_CLIENT", "")}))
     sys.exit(0)
 if sys.argv[1:3] != ["auth", "login"]:
     sys.exit(2)
@@ -38,9 +39,10 @@ request = conn.recv(4096).decode()
 conn.sendall(b"HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nOK")
 conn.close()
 sock.close()
-if "code=good" not in request:
+code = request.split("code=", 1)[1].split(" ", 1)[0].split("&", 1)[0] if "code=" in request else ""
+if code not in ("good", "alpha", "beta"):
     sys.exit(1)
-(dir / "credentials.enc").write_text("fixture-value")
+(dir / "credentials.enc").write_text(code)
 print(json.dumps({"status": "success", "account": "user@example.com"}), flush=True)
 '''
 
@@ -66,11 +68,22 @@ class LoginTests(unittest.TestCase):
         self.handles.append((handle, callback))
         return handle
 
-    def start(self, user="42", timeout=10):
+    def start(self, user="42", timeout: float = 10, **kwargs):
         return self.manager.start(
             self.home, "telegram", "100", user, "user@example.com", str(self.fake),
-            self.register, timeout=timeout,
+            self.register, timeout=timeout, **kwargs,
         )
+
+    def seed_account(self, account="user@example.com", content="old-credentials"):
+        directory = self.home / "accounts" / account
+        directory.mkdir(parents=True)
+        (directory / "credentials.enc").write_text(content)
+        return directory
+
+    def finish_with(self, result, code="good", user="42"):
+        from urllib.parse import parse_qs, urlsplit
+        redirect = parse_qs(urlsplit(result["url"]).query)["redirect_uri"][0]
+        return asyncio.run(self.handles[0][1](event=self.event(redirect + "?code=" + code, user=user)))
 
     def event(self, text, user="42"):
         return SimpleNamespace(text=text, source=SimpleNamespace(
@@ -290,6 +303,125 @@ class LoginTests(unittest.TestCase):
                 self.assertFalse(attempt.directory.exists())
                 self.assertIsNotNone(attempt.process.poll())
                 self.assertFalse(self.manager._attempts)
+
+    def test_existing_account_requires_explicit_reauthorize(self):
+        account = self.seed_account()
+        result = self.start()
+        self.assertFalse(result["ok"])
+        self.assertIn("reauthorize=true", result["error"])
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+        self.assertFalse(self.manager._attempts)
+
+    def test_reauthorize_rejects_non_boolean_flags(self):
+        account = self.seed_account()
+        for value in ("false", "true", 1, None):
+            self.assertFalse(self.start(reauthorize=value)["ok"])
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+        self.assertFalse(self.manager._attempts)
+
+    def test_commit_revalidates_destination(self):
+        account = self.seed_account()
+        self.assertTrue(self.start(reauthorize=True)["ok"])
+        attempt = next(iter(self.manager._attempts.values()))
+        moved = account.with_name("preserved")
+        account.rename(moved)
+        account.symlink_to(moved, target_is_directory=True)
+        response = self.manager.finish(self.home, "telegram", "100", "42",
+                                       "user@example.com", attempt.redirect + "?code=good")
+        self.assertFalse(response["ok"])
+        self.assertTrue(account.is_symlink())
+        self.assertEqual((moved / "credentials.enc").read_text(), "old-credentials")
+
+    def test_reauthorize_keeps_old_credentials_until_new_identity_commits(self):
+        account = self.seed_account()
+        result = self.start(reauthorize=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+
+        response = self.finish_with(result, "good")
+
+        self.assertEqual(response["action"], "rewrite")
+        self.assertIn("user@example.com", response["text"])
+        self.assertNotIn("code=", response["text"])
+        self.assertEqual((account / "credentials.enc").read_text(), "good")
+        self.assertFalse(list((self.home / "accounts").glob(".*.backup-*")))
+
+    def test_reauthorize_identity_mismatch_leaves_old_credentials(self):
+        account = self.seed_account("other@example.com")
+        result = self.manager.start(
+            self.home, "telegram", "100", "42", "other@example.com", str(self.fake),
+            self.register, timeout=10, reauthorize=True,
+        )
+        self.assertTrue(result["ok"])
+
+        response = self.finish_with(result, "good")
+
+        self.assertEqual(response["action"], "rewrite")
+        self.assertIn("no se pudo", response["text"])
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+        self.assertFalse(self.manager._attempts)
+
+    def test_reauthorize_cancelled_flow_leaves_old_credentials(self):
+        account = self.seed_account()
+        result = self.start(reauthorize=True)
+        self.assertTrue(result["ok"])
+
+        response = self.finish_with(result, "bad")
+
+        self.assertEqual(response["action"], "rewrite")
+        self.assertIn("no se pudo", response["text"])
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+        self.assertFalse(self.manager._attempts)
+
+    def test_reauthorize_timeout_leaves_old_credentials(self):
+        from time import sleep
+        account = self.seed_account()
+        result = self.start(timeout=0.3, reauthorize=True)
+        self.assertTrue(result["ok"])
+
+        sleep(0.7)
+
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+        self.assertFalse(self.manager.has_pending(self.home, "telegram", "100", "42"))
+
+    def test_reauthorize_commit_failure_restores_old_credentials(self):
+        account = self.seed_account()
+        result = self.start(reauthorize=True)
+        self.assertTrue(result["ok"])
+        attempt = next(iter(self.manager._attempts.values()))
+        real_rename = os.rename
+
+        def fail_new_install(source, target):
+            if Path(source) == attempt.directory:
+                raise OSError("commit fixture failure")
+            return real_rename(source, target)
+
+        with mock.patch.object(oauth.os, "rename", side_effect=fail_new_install):
+            response = self.manager.finish(
+                self.home, "telegram", "100", "42", "user@example.com",
+                attempt.redirect + "?code=good",
+            )
+
+        self.assertFalse(response["ok"])
+        self.assertIn("no se pudo", response["error"])
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+        self.assertFalse(list((self.home / "accounts").glob(".*.backup-*")))
+        self.assertFalse(self.manager._attempts)
+
+    def test_overlapping_reauthorize_leaves_one_consistent_account(self):
+        account = self.seed_account()
+        first = self.start(user="42", reauthorize=True)
+        second = self.start(user="43", reauthorize=True)
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual((account / "credentials.enc").read_text(), "old-credentials")
+
+        self.finish_with(first, "alpha", user="42")
+        self.assertEqual((account / "credentials.enc").read_text(), "alpha")
+        self.finish_with(second, "beta", user="43")
+        self.assertEqual((account / "credentials.enc").read_text(), "beta")
+        self.assertFalse(list((self.home / "accounts").glob(".*.backup-*")))
+        self.assertFalse(self.manager._attempts)
 
     def test_same_port_different_path_is_rejected_and_expired_attempt_not_reused(self):
         result = self.start()

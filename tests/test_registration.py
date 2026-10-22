@@ -83,6 +83,23 @@ class RegistrationTests(unittest.TestCase):
             handler({"account": "user@example.com"}, session_id="do-not-substitute")
             self.assertEqual(starts[-1][0][1:4], ("telegram", "shared-chat", ""))
             self.assertIn("callback_url", tools["gws_login"]["schema"]["parameters"]["properties"])
+            self.assertIn("reauthorize", tools["gws_login"]["schema"]["parameters"]["properties"])
+            self.assertIn("check_health", tools["gws_accounts"]["schema"]["parameters"]["properties"])
+
+            handler = tools["gws_login"]["handler"]
+            self.assertTrue(json.loads(handler({"account": "user@example.com", "reauthorize": True}))["ok"])
+            self.assertIs(starts[-1][1]["reauthorize"], True)
+
+            account = state_dir / "accounts" / "user@example.com"
+            account.mkdir(parents=True)
+            (account / "credentials.enc").write_text("fixture")
+            plain = json.loads(tools["gws_accounts"]["handler"]({}))
+            self.assertEqual(plain, {"ok": True, "accounts": ["user@example.com"]})
+            with patch.object(plugin, "account_health", return_value={"state": "valid", "stored": True,
+                                                                      "valid": True, "reauth_required": False}):
+                checked = json.loads(tools["gws_accounts"]["handler"]({"check_health": True}))
+            self.assertEqual(checked["accounts"], ["user@example.com"])
+            self.assertEqual(checked["health"]["user@example.com"]["state"], "valid")
 
 
 if __name__ == "__main__":
