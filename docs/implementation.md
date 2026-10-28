@@ -15,6 +15,8 @@ Plugin activation creates the profile-local `$HERMES_HOME/gws-oauth/` directory 
 
 `gws_api` selects the chosen account through `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` and executes `[gws_bin, *args]` without a shell or semantic filtering. Command policy, local file access, and remote mutations remain the user's responsibility, exactly as when using `gws` from a terminal.
 
+Successful `gws_api` stdout above 200,000 characters is stored without truncation in a unique `response-*` directory under the active profile's `gws-oauth` root. Directory mode is 0700 and file mode is 0600. The result returns `output_file`, `output_bytes`, and `output_encoding="utf-8"` instead of inline `data`; callers parse the file locally (Gmail attachments require JSON base64url decoding) and remove it and its directory after use. This is not streaming: subprocess stdout remains buffered in memory. Native failures never create response files. A local write failure cleans up partial files and reports `output_write_failed`, warning against blindly retrying remote mutations. Regression checks cover exact UTF-8 roundtrip, permissions, failed native commands, and local write failure.
+
 ## Important boundaries
 
 The hook runs before the gateway authorization check, so binding every attempt to its profile, platform, chat, and sender is mandatory. A recognized callback must be rewritten even when parsing or authorization fails, because an unhandled hook error could otherwise allow the original message to continue.

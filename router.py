@@ -4,6 +4,8 @@ import json
 import os
 import re
 import subprocess
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 from contextlib import contextmanager
 import threading
@@ -263,7 +265,26 @@ def execute_gws(root, account, args, *, gws_bin="gws"):
     if result.returncode:
         return {"ok": False, **classify_gws_failure(result.returncode, result.stdout, result.stderr)}
     if len(result.stdout) > 200_000:
-        return {"ok": False, "error": "Salida demasiado larga; acota la solicitud"}
+        # ponytail: spill only large successes; native stdout is still buffered in memory.
+        directory = output = None
+        try:
+            directory = Path(tempfile.mkdtemp(prefix="response-", dir=Path(root).resolve()))
+            output = directory / "stdout.txt"
+            with output.open("x", encoding="utf-8") as handle:
+                os.chmod(output, 0o600)
+                handle.write(result.stdout)
+            return {"ok": True, "account": account, "output_file": str(output),
+                    "output_bytes": output.stat().st_size, "output_encoding": "utf-8",
+                    "detail": "Salida completa guardada localmente; léela con código. Si es un adjunto Gmail, decodifica el campo JSON data como base64url. Elimina el archivo y su directorio al terminar."}
+        except OSError:
+            if output is not None:
+                with suppress(OSError):
+                    output.unlink()
+            if directory is not None:
+                with suppress(OSError):
+                    directory.rmdir()
+            return {"ok": False, "error_code": "output_write_failed",
+                    "error": "gws terminó correctamente, pero no se pudo guardar la salida grande. Revisa el espacio y permisos locales; no repitas una escritura remota sin comprobarla."}
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:

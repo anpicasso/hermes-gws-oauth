@@ -92,7 +92,7 @@ def register(ctx):
     )
     ctx.register_tool(
         name="gws_api", toolset="gws_oauth", handler=api,
-        schema={"name": "gws_api", "description": "Ejecuta gws tal cual para una cuenta explícita del perfil. Los argumentos se pasan sin limitar comandos, opciones ni acceso a archivos locales. Si gws falla, devuelve error_code, category, action, reauth_required y exit_code con un mensaje saneado; nunca incluye stdout/stderr crudos.",
+        schema={"name": "gws_api", "description": "Ejecuta gws tal cual para una cuenta explícita del perfil. Los argumentos se pasan sin limitar comandos, opciones ni acceso a archivos locales. Las respuestas exitosas mayores a 200000 caracteres devuelven output_file (archivo local UTF-8 completo) y output_bytes en vez de data; procesa ese archivo con código y elimínalo después. Para adjuntos Gmail decodifica el campo data del JSON como base64url. Si gws falla, devuelve error_code, category, action, reauth_required y exit_code con un mensaje saneado; nunca incluye stdout/stderr crudos.",
                 "parameters": {"type": "object", "properties": {
                     "account": {"type": "string", "description": "Correo exacto de una cuenta autorizada"},
                     "args": {"type": "array", "items": {"type": "string"}, "description": "Argumentos exactos posteriores al ejecutable gws, por ejemplo [\"drive\",\"files\",\"list\"]"}},

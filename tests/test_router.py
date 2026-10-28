@@ -24,6 +24,45 @@ def _fake_gws(tmp, body):
 
 
 class RouterTests(unittest.TestCase):
+    def test_large_success_is_saved_complete_and_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _account(tmp)
+            output = json.dumps({"data": "A" * 210_000, "label": "dólares"}, ensure_ascii=False)
+            with mock.patch("router.subprocess.run", return_value=mock.Mock(
+                returncode=0, stdout=output, stderr="ignored"
+            )):
+                result = execute_gws(tmp, "person@example.com", ["gmail", "users", "messages", "attachments", "get"])
+            self.assertTrue(result["ok"])
+            saved = Path(result["output_file"])
+            self.assertEqual(saved.read_text(encoding="utf-8"), output)
+            self.assertEqual(result["output_bytes"], len(output.encode("utf-8")))
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(saved.parent.stat().st_mode & 0o777, 0o700)
+            self.assertTrue(saved.is_relative_to(Path(tmp)))
+            self.assertNotIn("data", result)
+
+    def test_large_failure_is_not_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _account(tmp)
+            with mock.patch("router.subprocess.run", return_value=mock.Mock(
+                returncode=2, stdout="secret" * 40_000, stderr="invalid_grant"
+            )):
+                result = execute_gws(tmp, "person@example.com", ["anything"])
+            self.assertFalse(result["ok"])
+            self.assertNotIn("output_file", result)
+            self.assertFalse(list(Path(tmp).glob("response-*")))
+
+    def test_large_response_write_failure_is_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _account(tmp)
+            with mock.patch("router.subprocess.run", return_value=mock.Mock(
+                returncode=0, stdout="x" * 210_000, stderr=""
+            )), mock.patch("tempfile.mkdtemp", side_effect=OSError("private-details")):
+                result = execute_gws(tmp, "person@example.com", ["anything"])
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error_code"], "output_write_failed")
+            self.assertNotIn("private-details", str(result))
+
     @unittest.skipIf(os.name != "posix", "POSIX flock check")
     def test_native_calls_and_other_processes_share_swap_lock(self):
         import fcntl
