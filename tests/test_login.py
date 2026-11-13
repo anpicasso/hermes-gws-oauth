@@ -434,7 +434,121 @@ class LoginTests(unittest.TestCase):
         failure = asyncio.run(callback(event=self.event(redirect + "?code=bad")))
         self.assertEqual(failure["action"], "rewrite")
         self.assertNotIn("code=", failure["text"])
+        self.assertIn("gws_failed", failure["text"])
         self.assertFalse(self.manager.has_pending(self.home, "telegram", "100", "42"))
+
+    # --- local browser: the redirect reaches the gws loopback without any paste ---
+
+    def browser_hits_loopback(self, attempt, code="good"):
+        """Simulate a browser on the Hermes host following the redirect itself."""
+        import http.client
+        from urllib.parse import urlsplit
+        conn = http.client.HTTPConnection("127.0.0.1", urlsplit(attempt.redirect).port, timeout=3)
+        conn.request("GET", "/?code=" + code)
+        conn.getresponse().read()
+        conn.close()
+        self.assertTrue(attempt.done.wait(5), "watcher must finish the local exchange")
+
+    def test_local_browser_completion_registers_account_without_paste(self):
+        result = self.start()
+        key, attempt = next(iter(self.manager._attempts.items()))
+        self.browser_hits_loopback(attempt)
+        self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
+        self.assertFalse(attempt.directory.exists())
+        self.assertTrue(attempt.finished)
+        self.assertTrue(attempt.result["ok"])
+        self.assertTrue(attempt.result["local_browser"])
+        # The attempt stays registered so the hook still swallows a late paste.
+        self.assertTrue(self.manager.has_pending(self.home, "telegram", "100", "42"))
+        self.assertTrue(self.handles[0][0].active)
+
+    def test_local_browser_outcome_is_handed_over_by_status_call_once(self):
+        self.start()
+        attempt = next(iter(self.manager._attempts.values()))
+        self.browser_hits_loopback(attempt)
+        status = self.start()
+        self.assertTrue(status["ok"], status)
+        self.assertTrue(status["consumed"])
+        self.assertIn("user@example.com", status["message"])
+        self.assertFalse(self.manager._attempts)
+        self.assertFalse(self.handles[0][0].active)
+        again = self.start()
+        self.assertFalse(again["ok"])
+        self.assertIn("reauthorize=true", again["error"])
+
+    def test_late_paste_after_local_completion_is_rewritten_with_stored_outcome(self):
+        result = self.start()
+        attempt = next(iter(self.manager._attempts.values()))
+        self.browser_hits_loopback(attempt)
+        response = self.finish_with(result, "good")
+        self.assertEqual(response["action"], "rewrite")
+        self.assertIn("user@example.com", response["text"])
+        self.assertIn("navegador local", response["text"])
+        self.assertNotIn("code=", response["text"])
+        self.assertFalse(self.manager._attempts)
+        self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
+
+    def test_local_browser_identity_mismatch_is_reported_and_staging_removed(self):
+        result = self.manager.start(self.home, "telegram", "100", "42", "other@example.com",
+                                    str(self.fake), self.register, timeout=10)
+        self.assertTrue(result["ok"])
+        attempt = next(iter(self.manager._attempts.values()))
+        self.browser_hits_loopback(attempt)
+        self.assertFalse(attempt.result["ok"])
+        self.assertEqual(attempt.result["reason"], "identity_mismatch")
+        self.assertFalse(attempt.directory.exists(), "wrong-identity credentials must not linger")
+        self.assertFalse((self.home / "accounts" / "other@example.com").exists())
+        status = self.manager.start(self.home, "telegram", "100", "42", "other@example.com",
+                                    str(self.fake), self.register, timeout=10)
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["reason"], "identity_mismatch")
+        self.assertIn("no se pudo", status["error"])
+        fresh = self.manager.start(self.home, "telegram", "100", "42", "other@example.com",
+                                   str(self.fake), self.register, timeout=10)
+        self.assertTrue(fresh["ok"], "a consumed failure must not block a new login")
+
+    def test_local_browser_cancelled_consent_is_reported_as_gws_failure(self):
+        self.start()
+        attempt = next(iter(self.manager._attempts.values()))
+        self.browser_hits_loopback(attempt, code="bad")
+        self.assertEqual(attempt.result["reason"], "gws_failed")
+        self.assertFalse(attempt.directory.exists())
+        self.assertFalse((self.home / "accounts" / "user@example.com").exists())
+
+    def test_local_completion_is_released_at_deadline_and_account_survives(self):
+        from time import sleep
+        self.start(timeout=0.6)
+        attempt = next(iter(self.manager._attempts.values()))
+        self.browser_hits_loopback(attempt)
+        sleep(1.0)
+        self.assertFalse(self.manager.has_pending(self.home, "telegram", "100", "42"))
+        self.assertFalse(self.handles[0][0].active)
+        self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
+
+    def test_paste_racing_local_completion_reports_single_outcome(self):
+        import threading
+        result = self.start()
+        attempt = next(iter(self.manager._attempts.values()))
+        outcome = []
+        paster = threading.Thread(target=lambda: outcome.append(self.finish_with(result, "good")))
+        self.browser_hits_loopback(attempt)
+        paster.start()
+        paster.join(5)
+        self.assertFalse(paster.is_alive())
+        self.assertIn("user@example.com", outcome[0]["text"])
+        self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
+        self.assertFalse(self.manager._attempts)
+
+    def test_failure_reasons_are_stable_and_secret_free(self):
+        result = self.start()
+        attempt = next(iter(self.manager._attempts.values()))
+        response = self.manager.finish(self.home, "telegram", "100", "42", "user@example.com",
+                                       attempt.redirect + "?code=bad")
+        self.assertEqual(response["reason"], "gws_failed")
+        self.assertNotIn("bad", response["error"].replace("rechazado", ""))
+        self.assertIn("no se pudo", response["error"])
+        for reason in oauth._REASON_HINTS:
+            self.assertIn(reason, oauth._failure_message(reason))
 
 
 if __name__ == "__main__":

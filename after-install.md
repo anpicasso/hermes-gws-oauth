@@ -19,4 +19,6 @@ The profile file wins when both exist. Set file permissions to `0600`. Do not pa
 
 To renew an account that is already configured, call `gws_login` with `reauthorize=true` after this version is installed. The previous credentials stay in place until the new browser flow reports the requested identity. A mismatch, cancellation, or timeout leaves them intact; a failed replacement attempts to restore them. Avoid simultaneous native commands during the brief swap. See README for crash-recovery limitations. Use `gws_accounts(check_health=true)` for an optional live check that distinguishes stored credentials from a session confirmed by native `gws`.
 
+If the browser runs on the same host as Hermes, the redirect reaches the `gws` loopback directly and the login completes without pasting anything; the browser shows "Success". Confirm with `gws_accounts` or by calling `gws_login` again with the same `account` and no `callback_url`. Existing accounts and other profiles are untouched by this upgrade; a running gateway must be reloaded for the new behaviour to take effect.
+
 Run `gws auth status` to inspect the exact native `client_config` path on systems using a legacy location.
