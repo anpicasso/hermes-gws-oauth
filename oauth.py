@@ -103,11 +103,12 @@ def _remove_path(path):
 
 
 class LoginError(RuntimeError):
-    """Login failure with a stable, secret-free reason code."""
+    """Login failure with a stable, secret-free reason code and an optional safe detail."""
 
-    def __init__(self, reason, message=""):
+    def __init__(self, reason, message="", *, detail=""):
         super().__init__(message or reason)
         self.reason = reason
+        self.detail = detail
 
 
 _REASON_HINTS = {
@@ -115,16 +116,26 @@ _REASON_HINTS = {
     "expired": "el plazo del login venció",
     "callback_rejected": "gws no aceptó el callback local",
     "gws_failed": "gws terminó sin guardar credenciales (código rechazado o consentimiento cancelado)",
-    "identity_unconfirmed": "gws no devolvió la identidad de la cuenta",
-    "identity_mismatch": "la cuenta Google autorizada no es la solicitada",
+    "identity_unconfirmed": "gws no pudo leer el correo de la cuenta autorizada (userinfo)",
+    "identity_mismatch": "la cuenta Google autorizada no es la solicitada; revisa la ortografía exacta del correo",
     "account_exists": "la cuenta ya estaba registrada; usa reauthorize=true",
     "commit_failed": "no se pudieron guardar las credenciales en el perfil",
 }
 
 
-def _failure_message(reason):
+def _failure_message(reason, detail=""):
     hint = _REASON_HINTS.get(reason, "error interno")
-    return f"no se pudo completar el login ({reason}: {hint}). Inicia uno nuevo; no repitas el enlace."
+    extra = f"; {detail}" if detail else ""
+    return f"no se pudo completar el login ({reason}: {hint}{extra}). Inicia uno nuevo; no repitas el enlace."
+
+
+def _mask_identity(email):
+    """Masked, non-secret hint of the identity gws reported: first/last local char + domain."""
+    local, _, domain = str(email).partition("@")
+    if not local or not domain:
+        return ""
+    shown = local[0] + "***" + (local[-1] if len(local) > 1 else "")
+    return f"{shown}@{domain}"
 
 
 def _install_attempt(attempt, destination, accounts):
@@ -414,8 +425,15 @@ class LoginManager:
             result, _ = json.JSONDecoder().raw_decode(text[text.index("{"):])
         except (ValueError, KeyError):
             raise LoginError("identity_unconfirmed") from None
-        if not isinstance(result, dict) or str(result.get("account", "")).lower() != attempt.account:
-            raise LoginError("identity_mismatch")
+        if not isinstance(result, dict):
+            raise LoginError("identity_unconfirmed")
+        reported = str(result.get("account", "") or "").strip().lower()
+        if not reported or reported == "(unknown)" or "@" not in reported:
+            # gws prints "(unknown)" when its userinfo call failed; the identity was never confirmed.
+            raise LoginError("identity_unconfirmed")
+        if reported != attempt.account:
+            raise LoginError("identity_mismatch",
+                             detail=f"Google autorizó {_mask_identity(reported)}, se pidió {attempt.account}")
         accounts = root / "accounts"
         accounts.mkdir(mode=0o700, parents=True, exist_ok=True)
         destination = accounts / attempt.account
@@ -440,7 +458,7 @@ class LoginManager:
             return {"ok": True, "account": account, "local_browser": local,
                     "message": f"[Google Workspace: {account} autorizada en este perfil; credenciales guardadas{via}. Verifica con gws_accounts y gws_api.]"}
         except LoginError as exc:
-            return {"ok": False, "reason": exc.reason, "local_browser": local, "error": _failure_message(exc.reason)}
+            return {"ok": False, "reason": exc.reason, "local_browser": local, "error": _failure_message(exc.reason, exc.detail)}
         except Exception:
             return {"ok": False, "reason": "internal", "local_browser": local, "error": _failure_message("internal")}
 
@@ -499,7 +517,7 @@ class LoginManager:
             if parsed.username or parsed.password or parsed.fragment or len(code) != 1 or not code[0] or not re.fullmatch(r"[A-Za-z0-9_./~-]{1,2048}", code[0]):
                 raise LoginError("invalid_callback")
         except LoginError as exc:
-            result = {"ok": False, "reason": exc.reason, "error": _failure_message(exc.reason)}
+            result = {"ok": False, "reason": exc.reason, "error": _failure_message(exc.reason, exc.detail)}
         else:
             result = self._run_exchange(key, attempt, code[0])
         with attempt.lock:

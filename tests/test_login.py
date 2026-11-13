@@ -43,7 +43,7 @@ code = request.split("code=", 1)[1].split(" ", 1)[0].split("&", 1)[0] if "code="
 if code not in ("good", "alpha", "beta"):
     sys.exit(1)
 (dir / "credentials.enc").write_text(code)
-print(json.dumps({"status": "success", "account": "user@example.com"}), flush=True)
+print(json.dumps({"status": "success", "account": os.environ.get("FAKE_ACCOUNT", "user@example.com")}), flush=True)
 '''
 
 
@@ -620,6 +620,41 @@ class LoginTests(unittest.TestCase):
         self.assertTrue(attempt.process.stdout.closed)
         self.assertFalse(self.manager._attempts)
         self.assertFalse(self.handles[0][0].active)
+
+    def test_identity_mismatch_reports_masked_identity_and_requested_account(self):
+        # Requested with a typo; Google reports the real address (case-insensitive compare).
+        with mock.patch.dict(os.environ, {"FAKE_ACCOUNT": "Angello.Picasso@kaito.io"}):
+            result = self.manager.start(self.home, "telegram", "100", "42", "angello.picaso@kaito.io",
+                                        str(self.fake), self.register, timeout=10)
+            self.assertTrue(result["ok"])
+            attempt = next(iter(self.manager._attempts.values()))
+            response = self.manager.finish(self.home, "telegram", "100", "42", "angello.picaso@kaito.io",
+                                           attempt.redirect + "?code=good")
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["reason"], "identity_mismatch")
+        self.assertIn("a***o@kaito.io", response["error"])
+        self.assertIn("se pidió angello.picaso@kaito.io", response["error"])
+        self.assertNotIn("angello.picasso@kaito.io", response["error"], "the full reported address is never echoed")
+        self.assertFalse((self.home / "accounts" / "angello.picaso@kaito.io").exists())
+        self.assertFalse((self.home / "accounts" / "angello.picasso@kaito.io").exists())
+        self.assertFalse(attempt.directory.exists())
+
+    def test_unknown_identity_is_reported_as_unconfirmed_not_mismatch(self):
+        with mock.patch.dict(os.environ, {"FAKE_ACCOUNT": "(unknown)"}):
+            result = self.start()
+            self.assertTrue(result["ok"])
+            response = self.finish_with(result, "good")
+        self.assertEqual(response["action"], "rewrite")
+        self.assertIn("identity_unconfirmed", response["text"])
+        self.assertNotIn("identity_mismatch", response["text"])
+        self.assertNotIn("code=", response["text"])
+        self.assertFalse((self.home / "accounts" / "user@example.com").exists())
+
+    def test_mask_identity_never_reveals_more_than_edges(self):
+        self.assertEqual(oauth._mask_identity("angello.picasso@kaito.io"), "a***o@kaito.io")
+        self.assertEqual(oauth._mask_identity("x@kaito.io"), "x***@kaito.io")
+        self.assertEqual(oauth._mask_identity("(unknown)"), "")
+        self.assertEqual(oauth._mask_identity(""), "")
 
     def test_failure_reasons_are_stable_and_secret_free(self):
         result = self.start()
