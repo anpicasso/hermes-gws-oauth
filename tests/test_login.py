@@ -525,19 +525,101 @@ class LoginTests(unittest.TestCase):
         self.assertFalse(self.handles[0][0].active)
         self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
 
-    def test_paste_racing_local_completion_reports_single_outcome(self):
+    def test_paste_while_watcher_is_committing_waits_for_single_outcome(self):
         import threading
+        from time import sleep
         result = self.start()
         attempt = next(iter(self.manager._attempts.values()))
+        entered, proceed = threading.Event(), threading.Event()
+        original = self.manager._fetch_and_commit
+        commits = []
+        def delayed(attempt, code, root):
+            commits.append(code)
+            entered.set()
+            proceed.wait(3)
+            return original(attempt, code, root)
+        self.manager._fetch_and_commit = delayed
+        # Local browser reaches the loopback; the watcher enters the exchange and blocks.
+        import http.client
+        from urllib.parse import urlsplit
+        conn = http.client.HTTPConnection("127.0.0.1", urlsplit(attempt.redirect).port, timeout=3)
+        conn.request("GET", "/?code=good")
+        conn.getresponse().read()
+        conn.close()
+        self.assertTrue(entered.wait(3))
         outcome = []
         paster = threading.Thread(target=lambda: outcome.append(self.finish_with(result, "good")))
-        self.browser_hits_loopback(attempt)
         paster.start()
+        sleep(0.3)
+        self.assertTrue(paster.is_alive(), "a paste racing the watcher must wait, not race")
+        self.assertEqual(commits, [None], "only the watcher runs the exchange")
+        proceed.set()
         paster.join(5)
         self.assertFalse(paster.is_alive())
+        self.assertEqual(commits, [None])
         self.assertIn("user@example.com", outcome[0]["text"])
+        self.assertIn("navegador local", outcome[0]["text"])
         self.assertTrue((self.home / "accounts" / "user@example.com" / "credentials.enc").is_file())
         self.assertFalse(self.manager._attempts)
+
+    def test_deadline_never_closes_stdout_of_exited_process_under_watcher(self):
+        import threading
+        from time import sleep
+        self.start(timeout=0.4)
+        attempt = next(iter(self.manager._attempts.values()))
+        entered, proceed = threading.Event(), threading.Event()
+        original = self.manager._fetch_and_commit
+        def delayed(attempt, code, root):
+            entered.set()
+            proceed.wait(3)
+            return original(attempt, code, root)
+        self.manager._fetch_and_commit = delayed
+        import http.client
+        from urllib.parse import urlsplit
+        conn = http.client.HTTPConnection("127.0.0.1", urlsplit(attempt.redirect).port, timeout=3)
+        conn.request("GET", "/?code=good")
+        conn.getresponse().read()
+        conn.close()
+        self.assertTrue(entered.wait(3))
+        sleep(0.6)  # deadline timer fires while the watcher owns the exited process
+        self.assertTrue(attempt.expired)
+        self.assertFalse(attempt.process.stdout.closed, "timer must not close stdout mid-read")
+        self.assertTrue(attempt.directory.exists(), "timer must not delete a staging dir being committed")
+        proceed.set()
+        self.assertTrue(attempt.done.wait(5))
+        self.assertEqual(attempt.result["reason"], "expired")
+        self.assertFalse(attempt.directory.exists())
+        self.assertFalse(self.manager.has_pending(self.home, "telegram", "100", "42"))
+        self.assertFalse((self.home / "accounts" / "user@example.com").exists())
+
+    def test_close_waits_for_watcher_cleanup(self):
+        import threading
+        self.start()
+        attempt = next(iter(self.manager._attempts.values()))
+        entered, proceed = threading.Event(), threading.Event()
+        original = self.manager._fetch_and_commit
+        def delayed(attempt, code, root):
+            entered.set()
+            proceed.wait(3)
+            return original(attempt, code, root)
+        self.manager._fetch_and_commit = delayed
+        import http.client
+        from urllib.parse import urlsplit
+        conn = http.client.HTTPConnection("127.0.0.1", urlsplit(attempt.redirect).port, timeout=3)
+        conn.request("GET", "/?code=good")
+        conn.getresponse().read()
+        conn.close()
+        self.assertTrue(entered.wait(3))
+        closer = threading.Thread(target=self.manager.close)
+        closer.start()
+        proceed.set()
+        closer.join(5)
+        self.assertFalse(closer.is_alive())
+        self.assertTrue(attempt.finished)
+        self.assertFalse(attempt.directory.exists(), "unload must leave no staging directory behind")
+        self.assertTrue(attempt.process.stdout.closed)
+        self.assertFalse(self.manager._attempts)
+        self.assertFalse(self.handles[0][0].active)
 
     def test_failure_reasons_are_stable_and_secret_free(self):
         result = self.start()

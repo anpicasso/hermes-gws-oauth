@@ -205,46 +205,49 @@ class LoginManager:
               reauthorize=False):
         root = Path(root).expanduser().resolve()
         if not isinstance(reauthorize, bool):
-            return {"ok": False, "error": "reauthorize debe ser un booleano."}
+            return {"ok": False, "reason": "invalid_arguments", "error": "reauthorize debe ser un booleano."}
         key = self._key(root, platform, chat_id, user_id, profile)
         if not platform or not chat_id or not user_id:
-            return {"ok": False, "error": "Esta sesión necesita una identidad estable para completar OAuth."}
+            return {"ok": False, "reason": "no_session_identity", "error": "Esta sesión necesita una identidad estable para completar OAuth."}
         if not _EMAIL.fullmatch(account or ""):
-            return {"ok": False, "error": "Indica el correo exacto de la cuenta Google."}
+            return {"ok": False, "reason": "invalid_arguments", "error": "Indica el correo exacto de la cuenta Google."}
         if not 0 < timeout <= 900:
-            return {"ok": False, "error": "Plazo de OAuth no válido."}
+            return {"ok": False, "reason": "invalid_arguments", "error": "Plazo de OAuth no válido."}
         with self._lock:
             existing = self._attempts.get(key)
-            if existing is not None and existing.finished:
-                # Outcome of a login that gws completed by itself (local browser)
-                # or that failed without a paste: hand it over exactly once.
-                self._remove(key, existing)
-                if existing.account == account.lower() and existing.result is not None:
-                    return dict(existing.result, consumed=True)
-            elif existing is not None:
-                return {"ok": False, "pending": True, "account": existing.account,
-                        "error": "Ya hay un login pendiente en este chat. Si el navegador ya mostró "
-                                 "'Success', vuelve a llamar gws_login con el mismo account (sin callback_url) "
-                                 "para leer el resultado; si no, pega la URL localhost o espera a que venza."}
+            if existing is not None:
+                with existing.lock:
+                    finished, stored = existing.finished, existing.result
+                if finished:
+                    # Outcome of a login that gws completed by itself (local browser)
+                    # or that failed without a paste: hand it over exactly once.
+                    self._remove(key, existing)
+                    if existing.account == account.lower() and stored is not None:
+                        return dict(stored, consumed=True)
+                else:
+                    return {"ok": False, "pending": True, "reason": "pending", "account": existing.account,
+                            "error": "Ya hay un login pendiente en este chat. Si el navegador ya mostró "
+                                     "'Success', vuelve a llamar gws_login con el mismo account (sin callback_url) "
+                                     "para leer el resultado; si no, pega la URL localhost o espera a que venza."}
         try:
             command = _login_command(gws_bin, scope_mode, scopes)
         except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "reason": "invalid_arguments", "error": str(exc)}
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("GOOGLE_WORKSPACE_CLI_") and k != "GOOGLE_APPLICATION_CREDENTIALS"}
         try:
             client = _select_client(root, gws_bin, env, global_client)
         except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "reason": "client_missing", "error": str(exc)}
         destination = root / "accounts" / account.lower()
         if destination.exists() or destination.is_symlink():
             if destination.is_symlink() or not destination.is_dir():
-                return {"ok": False, "error": "La ruta de la cuenta existente no es un directorio válido."}
+                return {"ok": False, "reason": "commit_failed", "error": "La ruta de la cuenta existente no es un directorio válido."}
             if not reauthorize:
-                return {"ok": False, "error": "La cuenta ya está configurada en este perfil. Usa reauthorize=true para renovarla sin tocar las credenciales actuales hasta confirmar la nueva identidad."}
+                return {"ok": False, "reason": "account_exists", "error": "La cuenta ya está configurada en este perfil. Usa reauthorize=true para renovarla sin tocar las credenciales actuales hasta confirmar la nueva identidad."}
         with self._lock:
             if key in self._attempts:
-                return {"ok": False, "pending": True, "error": "Ya hay un login pendiente en este chat."}
+                return {"ok": False, "pending": True, "reason": "pending", "error": "Ya hay un login pendiente en este chat."}
             pending_root = root / ".pending"
             pending_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory = pending_root / secrets.token_hex(12)
@@ -294,7 +297,7 @@ class LoginManager:
                 if "proc" in locals():
                     self._terminate(proc)
                 shutil.rmtree(directory, ignore_errors=True)
-                return {"ok": False, "error": "No se pudo iniciar gws auth login; revisa el binario y el cliente OAuth."}
+                return {"ok": False, "reason": "launch_failed", "error": "No se pudo iniciar gws auth login; revisa el binario y el cliente OAuth."}
 
     @staticmethod
     def _terminate(proc):
@@ -335,11 +338,21 @@ class LoginManager:
         shutil.rmtree(attempt.directory, ignore_errors=True)
 
     def close(self):
+        """Plugin unload: stop every attempt and wait briefly for owners to finish cleanup."""
         with self._lock:
             pending = list(self._attempts.items())
         for key, attempt in pending:
             self._expire(key, attempt)
             self._remove(key, attempt)
+        # An exchange thread may still be reading an exited process; give it a
+        # bounded chance to finish (commit or remove staging) without holding locks.
+        for _, attempt in pending:
+            if attempt.watcher is not None and attempt.watcher is not threading.current_thread():
+                attempt.watcher.join(3)
+            if attempt.processing and not attempt.finished:
+                attempt.done.wait(3)
+            if attempt.process.stdout is not None and not attempt.process.stdout.closed and attempt.finished:
+                attempt.process.stdout.close()
 
     def _watch_process(self, key, attempt):
         """Commit a login that gws completed by itself (browser on the Hermes host)."""
@@ -355,8 +368,8 @@ class LoginManager:
         if not result["ok"]:
             shutil.rmtree(attempt.directory, ignore_errors=True)
         with attempt.lock:
-            attempt.finished = True
             attempt.result = result
+            attempt.finished = True
             attempt.done.set()
             expired = attempt.expired
         if expired:
@@ -437,7 +450,7 @@ class LoginManager:
         with self._lock:
             attempt = self._attempts.get(key)
         if attempt is None or not isinstance(account, str) or account.lower() != attempt.account:
-            return {"ok": False, "error": "No hay un login pendiente para esta cuenta en esta sesión."}
+            return {"ok": False, "reason": "no_pending", "error": "No hay un login pendiente para esta cuenta en esta sesión."}
         try:
             if not isinstance(callback_url, str) or len(callback_url) > 8192:
                 raise ValueError("Callback inválido")
@@ -490,8 +503,8 @@ class LoginManager:
         else:
             result = self._run_exchange(key, attempt, code[0])
         with attempt.lock:
-            attempt.finished = True
             attempt.result = result
+            attempt.finished = True
             attempt.done.set()
         self._expire(key, attempt, finished=True)
         return result
