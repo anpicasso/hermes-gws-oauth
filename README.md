@@ -95,11 +95,16 @@ Hermes calls `gws_login` with one of the native `gws` permission modes:
 - `full` (default)
 - `custom` with explicit OAuth scopes
 
-Open the returned Google URL and grant access. When the browser fails while opening `localhost`, copy the **complete URL from the address bar** and paste it into the same chat. Both `http://localhost:...` and Safari's protocol-less `localhost:...` form are accepted. In gateway chats the plugin forwards the code to the waiting local `gws` process and rewrites the message before it reaches the agent.
+Open the returned Google URL and grant access. Two outcomes are possible, and both are handled:
+
+- **Browser on another device** (phone, laptop): the redirect to `localhost` fails in the browser. Copy the **complete URL from the address bar** and paste it into the same chat. Both `http://localhost:...` and Safari's protocol-less `localhost:...` form are accepted. In gateway chats the plugin forwards the code to the waiting local `gws` process and rewrites the message before it reaches the agent.
+- **Browser on the Hermes host**: the redirect reaches the `gws` loopback server directly, the browser shows "Success — you may now close this window", and `gws` exits by itself. A watcher thread validates the identity and commits the credentials without any paste. The attempt stays registered until the deadline so that a late paste of the same URL is still intercepted and answered with the stored outcome. To read that outcome, call `gws_login` again with the same `account` and no `callback_url`: the stored result is returned exactly once (`consumed: true`) and the attempt is released; `gws_accounts` also shows the account immediately.
 
 Outside gateway ingress there is deliberately no interception: the callback reaches the model and remains in chat history. Hermes completes the pending login by calling the same `gws_login` tool again with the original `account` and the pasted `callback_url`. Explicit completion is available on every platform, including gateways when the callback reaches the agent. No terminal command or core patch is required.
 
 A login expires after five minutes. Only one attempt may run for the same user and chat, while different users may authorize concurrently. The Google identity returned by `gws` must match the requested account.
+
+Every failure carries a stable, secret-free `reason`. Exchange failures: `invalid_callback`, `expired`, `callback_rejected`, `gws_failed`, `identity_unconfirmed`, `identity_mismatch`, `account_exists`, `commit_failed`, `internal`; they appear in the tool result and in the rewritten chat message, e.g. `no se pudo completar el login (identity_mismatch: ...)`. Pre-flight failures: `invalid_arguments`, `no_session_identity`, `client_missing`, `launch_failed`, `pending`, `account_exists`, `no_pending`. Codes, URLs and native output are never echoed.
 
 To renew an account that is already configured, call `gws_login` with `reauthorize=true`. Without that explicit flag the plugin refuses to touch an existing account. The previous credentials stay in place while the new browser flow runs; they are replaced only after `gws` reports the requested identity and the new `credentials.enc` exists. A mismatch, cancellation, or timeout preserves the old credentials; a failed replacement attempts to restore them. Preserving credentials does not make an expired authorization valid. Because one chat has one pending attempt, start renewal links sequentially or from separate chats.
 
@@ -120,6 +125,10 @@ $HERMES_HOME/gws-oauth/accounts/<account>/
 ```
 
 Each account receives its own `GOOGLE_WORKSPACE_CLI_CONFIG_DIR`.
+
+### Several Hermes profiles on one host
+
+Every profile owns a separate `$HERMES_HOME/gws-oauth/` tree (e.g. `~/.hermes/gws-oauth/` for the default profile and `~/.hermes/profiles/<name>/gws-oauth/` for named profiles). Accounts, staging directories, the `accounts/.lock` file, `.encryption_key`, `credentials.enc` and `token_cache.json` all live inside that tree, so logging an account into one profile never reads or writes another profile's accounts. Each profile runs its own gateway process, so `LoginManager`, the temporary hook and the random loopback ports are independent as well. The only shared artifact is the read-only OAuth client (`~/.config/gws/client_secret.json` or a profile override); sharing one Desktop client across many accounts is normal. With `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` set, native `gws` writes nothing under `~/.config/gws/`. The same Google account may be authorized in two profiles; each holds its own refresh token.
 
 ## Security and limitations
 

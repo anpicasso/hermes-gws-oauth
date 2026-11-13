@@ -2,6 +2,15 @@
 
 The gateway hook is leased only while a child waits on its loopback callback.
 Explicit callbacks pass through the model; neither path puts codes in CLI argv.
+
+Two completion paths exist:
+- Remote browser: the redirect to ``http://localhost:<port>`` fails in the
+  user's browser; the user pastes that URL and the plugin forwards only the
+  code to the live ``gws`` loopback server.
+- Local browser (same host as Hermes): the redirect reaches the ``gws``
+  loopback directly, ``gws`` exchanges the code and exits by itself. A watcher
+  thread validates and commits that result; a later paste of the same URL is
+  still intercepted and answered with the stored outcome.
 """
 from __future__ import annotations
 
@@ -93,16 +102,41 @@ def _remove_path(path):
         shutil.rmtree(path, ignore_errors=True)
 
 
+class LoginError(RuntimeError):
+    """Login failure with a stable, secret-free reason code."""
+
+    def __init__(self, reason, message=""):
+        super().__init__(message or reason)
+        self.reason = reason
+
+
+_REASON_HINTS = {
+    "invalid_callback": "la URL pegada no es el callback localhost de este login",
+    "expired": "el plazo del login venció",
+    "callback_rejected": "gws no aceptó el callback local",
+    "gws_failed": "gws terminó sin guardar credenciales (código rechazado o consentimiento cancelado)",
+    "identity_unconfirmed": "gws no devolvió la identidad de la cuenta",
+    "identity_mismatch": "la cuenta Google autorizada no es la solicitada",
+    "account_exists": "la cuenta ya estaba registrada; usa reauthorize=true",
+    "commit_failed": "no se pudieron guardar las credenciales en el perfil",
+}
+
+
+def _failure_message(reason):
+    hint = _REASON_HINTS.get(reason, "error interno")
+    return f"no se pudo completar el login ({reason}: {hint}). Inicia uno nuevo; no repitas el enlace."
+
+
 def _install_attempt(attempt, destination, accounts):
     """Install validated credentials, replacing the old account only on success."""
     with _commit_lock(accounts):
         if time.monotonic() >= attempt.deadline:
-            raise RuntimeError("El login venció antes de guardar las credenciales")
+            raise LoginError("expired", "El login venció antes de guardar las credenciales")
         if destination.exists() or destination.is_symlink():
             if destination.is_symlink() or not destination.is_dir():
-                raise RuntimeError("La ruta de la cuenta existente no es un directorio válido")
+                raise LoginError("commit_failed", "La ruta de la cuenta existente no es un directorio válido")
             if not attempt.reauthorize:
-                raise RuntimeError("La cuenta ya estaba registrada")
+                raise LoginError("account_exists", "La cuenta ya estaba registrada")
             backup = accounts / f".{destination.name}.backup-{secrets.token_hex(6)}"
             os.rename(destination, backup)
             try:
@@ -124,8 +158,12 @@ class _Attempt:
     deadline: float
     reauthorize: bool = False
     timer: threading.Timer | None = None
+    watcher: threading.Thread | None = None
     processing: bool = False
     expired: bool = False
+    finished: bool = False
+    result: dict | None = None
+    done: threading.Event = field(default_factory=threading.Event)
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -167,33 +205,49 @@ class LoginManager:
               reauthorize=False):
         root = Path(root).expanduser().resolve()
         if not isinstance(reauthorize, bool):
-            return {"ok": False, "error": "reauthorize debe ser un booleano."}
+            return {"ok": False, "reason": "invalid_arguments", "error": "reauthorize debe ser un booleano."}
         key = self._key(root, platform, chat_id, user_id, profile)
         if not platform or not chat_id or not user_id:
-            return {"ok": False, "error": "Esta sesión necesita una identidad estable para completar OAuth."}
+            return {"ok": False, "reason": "no_session_identity", "error": "Esta sesión necesita una identidad estable para completar OAuth."}
         if not _EMAIL.fullmatch(account or ""):
-            return {"ok": False, "error": "Indica el correo exacto de la cuenta Google."}
+            return {"ok": False, "reason": "invalid_arguments", "error": "Indica el correo exacto de la cuenta Google."}
         if not 0 < timeout <= 900:
-            return {"ok": False, "error": "Plazo de OAuth no válido."}
+            return {"ok": False, "reason": "invalid_arguments", "error": "Plazo de OAuth no válido."}
+        with self._lock:
+            existing = self._attempts.get(key)
+            if existing is not None:
+                with existing.lock:
+                    finished, stored = existing.finished, existing.result
+                if finished:
+                    # Outcome of a login that gws completed by itself (local browser)
+                    # or that failed without a paste: hand it over exactly once.
+                    self._remove(key, existing)
+                    if existing.account == account.lower() and stored is not None:
+                        return dict(stored, consumed=True)
+                else:
+                    return {"ok": False, "pending": True, "reason": "pending", "account": existing.account,
+                            "error": "Ya hay un login pendiente en este chat. Si el navegador ya mostró "
+                                     "'Success', vuelve a llamar gws_login con el mismo account (sin callback_url) "
+                                     "para leer el resultado; si no, pega la URL localhost o espera a que venza."}
         try:
             command = _login_command(gws_bin, scope_mode, scopes)
         except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "reason": "invalid_arguments", "error": str(exc)}
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("GOOGLE_WORKSPACE_CLI_") and k != "GOOGLE_APPLICATION_CREDENTIALS"}
         try:
             client = _select_client(root, gws_bin, env, global_client)
         except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "reason": "client_missing", "error": str(exc)}
         destination = root / "accounts" / account.lower()
         if destination.exists() or destination.is_symlink():
             if destination.is_symlink() or not destination.is_dir():
-                return {"ok": False, "error": "La ruta de la cuenta existente no es un directorio válido."}
+                return {"ok": False, "reason": "commit_failed", "error": "La ruta de la cuenta existente no es un directorio válido."}
             if not reauthorize:
-                return {"ok": False, "error": "La cuenta ya está configurada en este perfil. Usa reauthorize=true para renovarla sin tocar las credenciales actuales hasta confirmar la nueva identidad."}
+                return {"ok": False, "reason": "account_exists", "error": "La cuenta ya está configurada en este perfil. Usa reauthorize=true para renovarla sin tocar las credenciales actuales hasta confirmar la nueva identidad."}
         with self._lock:
             if key in self._attempts:
-                return {"ok": False, "error": "Ya hay un login pendiente en este chat."}
+                return {"ok": False, "pending": True, "reason": "pending", "error": "Ya hay un login pendiente en este chat."}
             pending_root = root / ".pending"
             pending_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory = pending_root / secrets.token_hex(12)
@@ -224,8 +278,17 @@ class LoginManager:
                 timer.daemon = True
                 attempt.timer = timer
                 timer.start()
+                watcher = threading.Thread(target=self._watch_process, args=(key, attempt), daemon=True)
+                attempt.watcher = watcher
+                watcher.start()
                 return {"ok": True, "url": url, "account": account.lower(), "timeout_seconds": timeout,
-                        "instructions": "Abre el enlace, acepta los permisos y pega aquí la URL localhost completa que aparezca tras el error del navegador; puede venir con o sin http://."}
+                        "instructions": (
+                            "Abre el enlace y acepta los permisos con esa cuenta. "
+                            "Si el navegador corre en la misma máquina que Hermes verás 'Success' y la cuenta "
+                            "queda registrada sola: confírmalo con gws_accounts o llamando gws_login de nuevo "
+                            "con el mismo account. Si el navegador muestra un error de conexión en localhost, "
+                            "pega aquí la URL localhost completa de la barra de direcciones (con o sin http://)."
+                        )}
             except (OSError, ValueError, RuntimeError, TypeError):
                 self._attempts.pop(key, None)
                 if not self._attempts and self._hook is not None:
@@ -234,7 +297,7 @@ class LoginManager:
                 if "proc" in locals():
                     self._terminate(proc)
                 shutil.rmtree(directory, ignore_errors=True)
-                return {"ok": False, "error": "No se pudo iniciar gws auth login; revisa el binario y el cliente OAuth."}
+                return {"ok": False, "reason": "launch_failed", "error": "No se pudo iniciar gws auth login; revisa el binario y el cliente OAuth."}
 
     @staticmethod
     def _terminate(proc):
@@ -260,51 +323,126 @@ class LoginManager:
                 self._hook = None
 
     def _expire(self, key, attempt, *, finished=False):
+        """Deadline/unload/completion cleanup; an exchange in flight owns its own cleanup."""
         with attempt.lock:
             attempt.expired = True
-            processing = attempt.processing and not finished
+            in_flight = attempt.processing and not attempt.finished and not finished
+        if in_flight and attempt.process.poll() is not None:
+            # The exchange thread is reading the output of a process that already
+            # exited (local browser); closing its stdout here would corrupt that read.
+            return
         self._terminate(attempt.process)
-        if not processing:
-            self._remove(key, attempt)
-            shutil.rmtree(attempt.directory, ignore_errors=True)
+        if in_flight:
+            return
+        self._remove(key, attempt)
+        shutil.rmtree(attempt.directory, ignore_errors=True)
 
     def close(self):
+        """Plugin unload: stop every attempt and wait briefly for owners to finish cleanup."""
         with self._lock:
             pending = list(self._attempts.items())
         for key, attempt in pending:
             self._expire(key, attempt)
+            self._remove(key, attempt)
+        # An exchange thread may still be reading an exited process; give it a
+        # bounded chance to finish (commit or remove staging) without holding locks.
+        for _, attempt in pending:
+            if attempt.watcher is not None and attempt.watcher is not threading.current_thread():
+                attempt.watcher.join(3)
+            if attempt.processing and not attempt.finished:
+                attempt.done.wait(3)
+            if attempt.process.stdout is not None and not attempt.process.stdout.closed and attempt.finished:
+                attempt.process.stdout.close()
+
+    def _watch_process(self, key, attempt):
+        """Commit a login that gws completed by itself (browser on the Hermes host)."""
+        try:
+            attempt.process.wait()
+        except Exception:
+            return
+        with attempt.lock:
+            if attempt.expired or attempt.processing or attempt.finished:
+                return  # terminated by the plugin, or a pasted callback drives the exchange
+            attempt.processing = True
+        result = self._run_exchange(key, attempt, None, local=True)
+        if not result["ok"]:
+            shutil.rmtree(attempt.directory, ignore_errors=True)
+        with attempt.lock:
+            attempt.result = result
+            attempt.finished = True
+            attempt.done.set()
+            expired = attempt.expired
+        if expired:
+            self._remove(key, attempt)
+        # Otherwise stay registered until the deadline, a pasted callback or a
+        # gws_login status call hands the stored outcome over exactly once.
 
     @staticmethod
     def _fetch_and_commit(attempt, code, root):
-        port = urlsplit(attempt.redirect).port
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
-        try:
-            conn.request("GET", "/?code=" + code)
-            response = conn.getresponse()
-            response.read()
-            if response.status != 200:
-                raise RuntimeError("El callback local fue rechazado")
-        finally:
-            conn.close()
+        """Forward the code (if the loopback is still up), then validate and commit."""
+        process = attempt.process
+        if code is not None and process.poll() is None:
+            port = urlsplit(attempt.redirect).port
+            status = None
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                try:
+                    conn.request("GET", "/?code=" + code)
+                    response = conn.getresponse()
+                    response.read()
+                    status = response.status
+                finally:
+                    conn.close()
+            except OSError:
+                status = None
+            if status != 200:
+                # The loopback may be gone because the browser already reached it;
+                # accept that only if gws then finishes on its own.
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    raise LoginError("callback_rejected") from None
         remaining = max(0.1, attempt.deadline - time.monotonic())
-        out, _ = attempt.process.communicate(timeout=remaining)
-        if attempt.process.returncode != 0 or not (attempt.directory / "credentials.enc").is_file():
-            raise RuntimeError("gws no guardó credenciales")
+        try:
+            out, _ = process.communicate(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise LoginError("expired") from None
+        if process.returncode != 0 or not (attempt.directory / "credentials.enc").is_file():
+            raise LoginError("gws_failed")
         text = out.decode("utf-8", "replace")
         try:
-            result = json.loads(text[text.index("{"):])
+            result, _ = json.JSONDecoder().raw_decode(text[text.index("{"):])
         except (ValueError, KeyError):
-            raise RuntimeError("gws no confirmó la identidad") from None
-        if str(result.get("account", "")).lower() != attempt.account:
-            raise RuntimeError("La cuenta autorizada no coincide con la solicitada")
+            raise LoginError("identity_unconfirmed") from None
+        if not isinstance(result, dict) or str(result.get("account", "")).lower() != attempt.account:
+            raise LoginError("identity_mismatch")
         accounts = root / "accounts"
         accounts.mkdir(mode=0o700, parents=True, exist_ok=True)
         destination = accounts / attempt.account
         with attempt.lock:
             if attempt.expired or time.monotonic() >= attempt.deadline:
-                raise RuntimeError("El login venció antes de guardar las credenciales")
-            _install_attempt(attempt, destination, accounts)
+                raise LoginError("expired")
+            try:
+                _install_attempt(attempt, destination, accounts)
+            except LoginError:
+                raise
+            except OSError as exc:
+                raise LoginError("commit_failed") from exc
         return attempt.account
+
+    def _run_exchange(self, key, attempt, code, *, local=False):
+        """Run the exchange for one attempt; never raises, never echoes the code."""
+        try:
+            if time.monotonic() >= attempt.deadline:
+                raise LoginError("expired")
+            account = self._fetch_and_commit(attempt, code, Path(key[0]))
+            via = " (completado desde el navegador local)" if local else ""
+            return {"ok": True, "account": account, "local_browser": local,
+                    "message": f"[Google Workspace: {account} autorizada en este perfil; credenciales guardadas{via}. Verifica con gws_accounts y gws_api.]"}
+        except LoginError as exc:
+            return {"ok": False, "reason": exc.reason, "local_browser": local, "error": _failure_message(exc.reason)}
+        except Exception:
+            return {"ok": False, "reason": "internal", "local_browser": local, "error": _failure_message("internal")}
 
     def finish(self, root, platform, chat_id, user_id, account, callback_url, *, profile=""):
         """Complete a login explicitly on any surface, bound to its original identity."""
@@ -312,7 +450,7 @@ class LoginManager:
         with self._lock:
             attempt = self._attempts.get(key)
         if attempt is None or not isinstance(account, str) or account.lower() != attempt.account:
-            return {"ok": False, "error": "No hay un login pendiente para esta cuenta en esta sesión."}
+            return {"ok": False, "reason": "no_pending", "error": "No hay un login pendiente para esta cuenta en esta sesión."}
         try:
             if not isinstance(callback_url, str) or len(callback_url) > 8192:
                 raise ValueError("Callback inválido")
@@ -325,29 +463,51 @@ class LoginManager:
                     parsed.port != redirect.port or (parsed.path or "/") != (redirect.path or "/")):
                 raise ValueError("Callback inválido")
         except ValueError:
-            return {"ok": False, "error": "URL de callback inválida; copia la URL localhost completa de este login."}
+            return {"ok": False, "reason": "invalid_callback",
+                    "error": "URL de callback inválida; copia la URL localhost completa de este login."}
         # ponytail: explicit completion uses normal tool arguments, not another ingress hook.
         return self._complete_callback(key, attempt, parsed)
 
+    def _take_result(self, key, attempt):
+        """Hand a locally completed outcome over once and release the attempt."""
+        with self._lock, attempt.lock:
+            if not attempt.finished or attempt.result is None:
+                return None
+            self._remove(key, attempt)
+            return dict(attempt.result)
+
     def _complete_callback(self, key, attempt, parsed):
         with self._lock, attempt.lock:
-            if attempt.processing:
-                return {"ok": False, "error": "La autorización ya se está procesando."}
-            attempt.processing = True
+            if attempt.finished:
+                return self._take_result(key, attempt) or {"ok": False, "reason": "in_progress",
+                                                           "error": "La autorización ya se está procesando."}
+            waiting = attempt.processing
+            if not waiting:
+                attempt.processing = True
+        if waiting:
+            # The watcher is validating a login that the local browser already
+            # completed; report its outcome instead of racing it.
+            attempt.done.wait(timeout=max(0.1, attempt.deadline - time.monotonic()) + 5)
+            return self._take_result(key, attempt) or {"ok": False, "reason": "in_progress",
+                                                       "error": "La autorización ya se está procesando."}
         try:
-            query = parse_qs(parsed.query, strict_parsing=True)
+            try:
+                query = parse_qs(parsed.query, strict_parsing=True)
+            except ValueError:
+                raise LoginError("invalid_callback") from None
             code = query.get("code", [])
             if parsed.username or parsed.password or parsed.fragment or len(code) != 1 or not code[0] or not re.fullmatch(r"[A-Za-z0-9_./~-]{1,2048}", code[0]):
-                raise ValueError("Callback inválido")
-            if time.monotonic() >= attempt.deadline or attempt.process.poll() is not None:
-                raise RuntimeError("Intento vencido")
-            account = self._fetch_and_commit(attempt, code[0], Path(key[0]))
-            return {"ok": True, "account": account,
-                    "message": f"[Google Workspace: {account} autorizada en este perfil; credenciales guardadas. Verifica con gws_accounts y gws_api.]"}
-        except Exception:
-            return {"ok": False, "error": "no se pudo completar el login. Inicia uno nuevo; no repitas el enlace."}
-        finally:
-            self._expire(key, attempt, finished=True)
+                raise LoginError("invalid_callback")
+        except LoginError as exc:
+            result = {"ok": False, "reason": exc.reason, "error": _failure_message(exc.reason)}
+        else:
+            result = self._run_exchange(key, attempt, code[0])
+        with attempt.lock:
+            attempt.result = result
+            attempt.finished = True
+            attempt.done.set()
+        self._expire(key, attempt, finished=True)
+        return result
 
     async def on_message(self, event, **kwargs):
         source = event.source
@@ -386,7 +546,7 @@ class LoginManager:
             result = await asyncio.to_thread(self._complete_callback, key, attempt, parsed)
             message = result.get("message") or f"[Google Workspace: {result['error']}]"
         except (Exception, asyncio.CancelledError):
-            message = "[Google Workspace: no se pudo completar el login. Inicia uno nuevo; no repitas el enlace.]"
+            message = f"[Google Workspace: {_failure_message('internal')}]"
         gateway = kwargs.get("gateway")
         message_id = str(getattr(source, "message_id", "") or getattr(event, "message_id", "") or "")
         if gateway is not None and message_id:
